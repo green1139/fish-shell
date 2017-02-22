@@ -4,9 +4,12 @@
 
 // IWYU pragma: no_include <cstddef>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <time.h>
+#include <wctype.h>
+
 #include <deque>
 #include <memory>
 #include <set>
@@ -40,9 +43,11 @@ struct io_streams_t;
 typedef std::vector<wcstring> path_list_t;
 
 enum history_search_type_t {
-    // The history searches for strings containing the given string.
+    // Search for commands exactly matching the given string.
+    HISTORY_SEARCH_TYPE_EXACT = 1,
+    // Search for commands containing the given string.
     HISTORY_SEARCH_TYPE_CONTAINS,
-    // The history searches for strings starting with the given string.
+    // Search for commands starting with the given string.
     HISTORY_SEARCH_TYPE_PREFIX
 };
 
@@ -57,7 +62,8 @@ class history_item_t {
     bool merge(const history_item_t &item);
 
     // The actual contents of the entry.
-    wcstring contents;
+    wcstring contents;        // value as entered by the user
+    wcstring contents_lower;  // value normalized to all lowercase for case insensitive comparisons
 
     // Original creation time for the entry.
     time_t creation_timestamp;
@@ -69,15 +75,16 @@ class history_item_t {
     path_list_t required_paths;
 
    public:
-    explicit history_item_t(const wcstring &str);
-    explicit history_item_t(const wcstring &, time_t, history_identifier_t ident = 0);
+    explicit history_item_t(const wcstring &str, time_t when = 0, history_identifier_t ident = 0);
 
     const wcstring &str() const { return contents; }
+    const wcstring &str_lower() const { return contents_lower; }
 
     bool empty() const { return contents.empty(); }
 
     // Whether our contents matches a search term.
-    bool matches_search(const wcstring &term, enum history_search_type_t type) const;
+    bool matches_search(const wcstring &term, enum history_search_type_t type,
+                        bool case_sensitive) const;
 
     time_t timestamp() const { return creation_timestamp; }
 
@@ -173,6 +180,10 @@ class history_t {
     // Deletes duplicates in new_items.
     void compact_new_items();
 
+    // Attempts to rewrite the existing file to a target temporary file
+    // Returns false on error, true on success
+    bool rewrite_to_temporary_file(int tmp_fd, int existing_fd) const;
+
     // Saves history by rewriting the file.
     bool save_internal_via_rewrite();
 
@@ -188,7 +199,10 @@ class history_t {
     // Do a private, read-only map of the entirety of a history file with the given name. Returns
     // true if successful. Returns the mapped memory region by reference.
     bool map_file(const wcstring &name, const char **out_map_start, size_t *out_map_len,
-                  file_id_t *file_id);
+                  file_id_t *file_id) const;
+
+    // Like map_file but takes a file descriptor
+    bool map_fd(int fd, const char **out_map_start, size_t *out_map_len) const;
 
     // Whether we're in maximum chaos mode, useful for testing.
     bool chaos_mode;
@@ -224,8 +238,9 @@ class history_t {
     void save();
 
     // Searches history.
-    bool search(history_search_type_t search_type, wcstring_list_t search_args, bool with_time,
-                io_streams_t &streams);
+    bool search(history_search_type_t search_type, wcstring_list_t search_args,
+                const wchar_t *show_time_format, long max_items, bool case_sensitive,
+                bool null_terminate, io_streams_t &streams);
 
     // Enable / disable automatic saving. Main thread only!
     void disable_automatic_saving();
@@ -260,8 +275,12 @@ class history_search_t {
     // The history in which we are searching.
     history_t *history;
 
-    // Our type.
+    // The search term.
+    wcstring term;
+
+    // Our search type.
     enum history_search_type_t search_type;
+    bool case_sensitive;
 
     // Our list of previous matches as index, value. The end is the current match.
     typedef std::pair<size_t, history_item_t> prev_match_t;
@@ -269,9 +288,6 @@ class history_search_t {
 
     // Returns yes if a given term is in prev_matches.
     bool match_already_made(const wcstring &match) const;
-
-    // The search term.
-    wcstring term;
 
     // Additional strings to skip (sorted).
     wcstring_list_t external_skips;
@@ -308,11 +324,20 @@ class history_search_t {
 
     // Constructor.
     history_search_t(history_t &hist, const wcstring &str,
-                     enum history_search_type_t type = HISTORY_SEARCH_TYPE_CONTAINS)
-        : history(&hist), search_type(type), term(str) {}
+                     enum history_search_type_t type = HISTORY_SEARCH_TYPE_CONTAINS,
+                     bool case_sensitive = true)
+        : history(&hist), term(str), search_type(type), case_sensitive(case_sensitive) {
+        if (!case_sensitive) {
+            term = wcstring();
+            for (wcstring::const_iterator it = str.begin(); it != str.end(); ++it) {
+                term.push_back(towlower(*it));
+            }
+        }
+    }
 
     // Default constructor.
-    history_search_t() : history(), search_type(HISTORY_SEARCH_TYPE_CONTAINS), term() {}
+    history_search_t()
+        : history(), term(), search_type(HISTORY_SEARCH_TYPE_CONTAINS), case_sensitive(true) {}
 };
 
 // Init history library. The history file won't actually be loaded until the first time a history
@@ -325,34 +350,12 @@ void history_destroy();
 // Perform sanity checks.
 void history_sanity_check();
 
-// A helper class for threaded detection of paths.
-struct file_detection_context_t {
-    // Constructor.
-    explicit file_detection_context_t(history_t *hist, history_identifier_t ident = 0);
+// Given a list of paths and a working directory, return the paths that are valid
+// This does disk I/O and may only be called in a background thread
+path_list_t valid_paths(const path_list_t &paths, const wcstring &working_directory);
 
-    // Determine which of potential_paths are valid, and put them in valid_paths.
-    int perform_file_detection();
-
-    // The history associated with this context.
-    history_t *const history;
-
-    // The working directory at the time the command was issued.
-    wcstring working_directory;
-
-    // Paths to test.
-    path_list_t potential_paths;
-
-    // Paths that were found to be valid.
-    path_list_t valid_paths;
-
-    // Identifier of the history item to which we are associated.
-    const history_identifier_t history_item_identifier;
-
-    // Performs file detection. Returns 1 if every path in potential_paths is valid, 0 otherwise. If
-    // test_all is true, tests every path; otherwise stops as soon as it reaches an invalid path.
-    int perform_file_detection(bool test_all);
-
-    // Determine whether the given paths are all valid.
-    bool paths_are_valid(const path_list_t &paths);
-};
+// Given a list of paths and a working directory,
+// return true if all paths in the list are valid
+// Returns true for if paths is empty
+bool all_paths_are_valid(const path_list_t &paths, const wcstring &working_directory);
 #endif

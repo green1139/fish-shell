@@ -54,7 +54,9 @@
 #include <limits.h>
 #include <locale.h>
 #include <stdarg.h>
-#include <stdio.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <wchar.h>
@@ -238,7 +240,11 @@ void builtin_printf_state_t::append_format_output(const wchar_t *fmt, ...) {
 
 void builtin_printf_state_t::verify_numeric(const wchar_t *s, const wchar_t *end, int errcode) {
     if (errcode != 0) {
-        this->fatal_error(L"%ls: %s", s, strerror(errcode));
+        if (errcode == ERANGE) {
+            this->fatal_error(L"%ls: %ls", s, _(L"Number out of range"));
+        } else {
+            this->fatal_error(L"%ls: %s", s, strerror(errcode));
+        }
     } else if (*end) {
         if (s == end)
             this->fatal_error(_(L"%ls: expected a numeric value"), s);
@@ -264,11 +270,20 @@ uintmax_t raw_string_to_scalar_type(const wchar_t *s, wchar_t **end) {
 
 template <>
 long double raw_string_to_scalar_type(const wchar_t *s, wchar_t **end) {
-    // Forcing the locale to C is questionable but it's what the old C_STRTOD() that I inlined here
-    // as part of changing how locale management is done by fish.
-    char *old_locale = setlocale(LC_NUMERIC, "C");
     double val = wcstod(s, end);
-    setlocale(LC_NUMERIC, old_locale);
+    if (**end == L'\0') return val;
+
+    // The conversion using the user's locale failed. That may be due to the string not being a
+    // valid floating point value. It could also be due to the locale using different separator
+    // characters than the normal english convention. So try again by forcing the use of a locale
+    // that employs the english convention for writing floating point numbers.
+    //
+    // TODO: switch to the wcstod_l() function to avoid changing the global locale.
+    char *saved_locale = strdup(setlocale(LC_NUMERIC, NULL));
+    setlocale(LC_NUMERIC, "C");
+    val = wcstod(s, end);
+    setlocale(LC_NUMERIC, saved_locale);
+    free(saved_locale);
     return val;
 }
 
@@ -303,7 +318,7 @@ void builtin_printf_state_t::print_esc_char(wchar_t c) {
             break;
         }
         case L'e': {  // escape
-            this->append_output(L'\x1B');
+            this->append_output(L'\e');
             break;
         }
         case L'f': {  // form feed
@@ -426,6 +441,8 @@ void builtin_printf_state_t::print_direc(const wchar_t *start, size_t length, wc
     // Create a copy of the % directive, with an intmax_t-wide width modifier substituted for any
     // existing integer length modifier.
     switch (conversion) {
+        case L'x':
+        case L'X':
         case L'd':
         case L'i':
         case L'u': {
@@ -499,37 +516,46 @@ void builtin_printf_state_t::print_direc(const wchar_t *start, size_t length, wc
         case L'G': {
             long double arg = string_to_scalar_type<long double>(argument, this);
             if (!have_field_width) {
-                if (!have_precision)
+                if (!have_precision) {
                     this->append_format_output(fmt.c_str(), arg);
-                else
+                } else {
                     this->append_format_output(fmt.c_str(), precision, arg);
+                }
             } else {
-                if (!have_precision)
+                if (!have_precision) {
                     this->append_format_output(fmt.c_str(), field_width, arg);
-                else
+                } else {
                     this->append_format_output(fmt.c_str(), field_width, precision, arg);
+                }
             }
             break;
         }
         case L'c': {
-            if (!have_field_width)
+            if (!have_field_width) {
                 this->append_format_output(fmt.c_str(), *argument);
-            else
+            } else {
                 this->append_format_output(fmt.c_str(), field_width, *argument);
+            }
             break;
         }
         case L's': {
             if (!have_field_width) {
                 if (!have_precision) {
                     this->append_format_output(fmt.c_str(), argument);
-                } else
+                } else {
                     this->append_format_output(fmt.c_str(), precision, argument);
+                }
             } else {
-                if (!have_precision)
+                if (!have_precision) {
                     this->append_format_output(fmt.c_str(), field_width, argument);
-                else
+                } else {
                     this->append_format_output(fmt.c_str(), field_width, precision, argument);
+                }
             }
+            break;
+        }
+        default: {
+            DIE("unexpected opt");
             break;
         }
     }
@@ -579,8 +605,7 @@ int builtin_printf_state_t::print_formatted(const wchar_t *format, int argc, wch
                 }
 
                 modify_allowed_format_specifiers(ok, "aAcdeEfFgGiosuxX", true);
-
-                for (;; f++, direc_length++) {
+                for (bool continue_looking_for_flags = true; continue_looking_for_flags;) {
                     switch (*f) {
                         case L'I':
                         case L'\'': {
@@ -600,10 +625,16 @@ int builtin_printf_state_t::print_formatted(const wchar_t *format, int argc, wch
                             modify_allowed_format_specifiers(ok, "cs", false);
                             break;
                         }
-                        default: { goto no_more_flag_characters; }
+                        default: {
+                            continue_looking_for_flags = false;
+                            break;
+                        }
+                    }
+                    if (continue_looking_for_flags) {
+                        f++;
+                        direc_length++;
                     }
                 }
-            no_more_flag_characters:;
 
                 if (*f == L'*') {
                     ++f;
@@ -678,7 +709,10 @@ int builtin_printf_state_t::print_formatted(const wchar_t *format, int argc, wch
                 f += print_esc(f, false);
                 break;
             }
-            default: { this->append_output(*f); }
+            default: {
+                this->append_output(*f);
+                break;
+            }
         }
     }
     return save_argc - argc;
@@ -686,6 +720,7 @@ int builtin_printf_state_t::print_formatted(const wchar_t *format, int argc, wch
 
 /// The printf builtin.
 int builtin_printf(parser_t &parser, io_streams_t &streams, wchar_t **argv) {
+    UNUSED(parser);
     builtin_printf_state_t state(streams);
 
     wchar_t *format;

@@ -330,7 +330,7 @@ end
 function __fish_git_prompt --description "Prompt function for Git"
     # If git isn't installed, there's nothing we can do
     # Return 1 so the calling prompt can deal with it
-    if not command -s git >/dev/null
+    if not command -sq git
         return 1
     end
     set -l repo_info (command git rev-parse --git-dir --is-inside-git-dir --is-bare-repository --is-inside-work-tree HEAD ^/dev/null)
@@ -448,7 +448,7 @@ function __fish_git_prompt_staged --description "__fish_git_prompt helper, tells
     set -l staged
 
     if test -n "$sha"
-        command git diff-index --cached --quiet HEAD --
+        command git diff-index --cached --quiet HEAD -- ^/dev/null
         or set staged $___fish_git_prompt_char_stagedstate
     else
         set staged $___fish_git_prompt_char_invalidstate
@@ -460,7 +460,7 @@ function __fish_git_prompt_dirty --description "__fish_git_prompt helper, tells 
     set -l dirty
 
     set -l os
-    command git diff --no-ext-diff --quiet --exit-code
+    command git diff --no-ext-diff --quiet --exit-code ^/dev/null
     set os $status
     if test $os -ne 0
         set dirty $___fish_git_prompt_char_dirtystate
@@ -472,17 +472,20 @@ set -g ___fish_git_prompt_status_order stagedstate invalidstate dirtystate untra
 
 function __fish_git_prompt_informative_status
 
-    set -l changedFiles (command git diff --name-status | cut -c 1-2)
-    set -l stagedFiles (command git diff --staged --name-status | cut -c 1-2)
+    set -l changedFiles (command git diff --name-status | string match -r \\w)
+    set -l stagedFiles (command git diff --staged --name-status | string match -r \\w)
 
-    set -l dirtystate (math (count $changedFiles) - (count (echo $changedFiles | grep "U")))
-    set -l invalidstate (count (echo $stagedFiles | grep "U"))
-    set -l stagedstate (math (count $stagedFiles) - $invalidstate)
-    set -l untrackedfiles (count (command git ls-files --others --exclude-standard))
+    set -l dirtystate (math (count $changedFiles) - (count (string match -r "U" -- $changedFiles)) ^/dev/null)
+    set -l invalidstate (count (string match -r "U" -- $stagedFiles))
+    set -l stagedstate (math (count $stagedFiles) - $invalidstate ^/dev/null)
+    set -l untrackedfiles (command git ls-files --others --exclude-standard | wc -l | string trim)
 
     set -l info
 
-    if [ (math $dirtystate + $invalidstate + $stagedstate + $untrackedfiles) = 0 ]
+    # If `math` fails for some reason, assume the state is clean - it's the simpler path
+    set -l state (math $dirtystate + $invalidstate + $stagedstate + $untrackedfiles ^/dev/null)
+    if test -z "$state"
+        or test "$state" = 0
         set info $___fish_git_prompt_color_cleanstate$___fish_git_prompt_char_cleanstate$___fish_git_prompt_color_cleanstate_done
     else
         for i in $___fish_git_prompt_status_order

@@ -4,10 +4,6 @@
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
-#include <deque>
-#include <list>
-#include <queue>
-#include <utility>
 #ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
 #endif
@@ -16,9 +12,11 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <wchar.h>
-#include <wctype.h>
-#include <cwctype>
+
+#include <deque>
+#include <list>
 #include <memory>
+#include <type_traits>
 
 #include "common.h"
 #include "env.h"
@@ -27,19 +25,19 @@
 #include "input_common.h"
 #include "iothread.h"
 #include "util.h"
+#include "wutil.h"
 
 /// Time in milliseconds to wait for another byte to be available for reading
-/// after \x1b is read before assuming that escape key was pressed, and not an
+/// after \e is read before assuming that escape key was pressed, and not an
 /// escape sequence.
 #define WAIT_ON_ESCAPE_DEFAULT 300
 static int wait_on_escape_ms = WAIT_ON_ESCAPE_DEFAULT;
 
 /// Characters that have been read and returned by the sequence matching code.
-static std::deque<wint_t> lookahead_list;
+static std::deque<wchar_t> lookahead_list;
 
 // Queue of pairs of (function pointer, argument) to be invoked. Expected to be mostly empty.
-typedef std::pair<void (*)(void *), void *> callback_info_t;
-typedef std::queue<callback_info_t, std::list<callback_info_t> > callback_queue_t;
+typedef std::list<std::function<void(void)>> callback_queue_t;
 static callback_queue_t callback_queue;
 static void input_flush_callbacks(void);
 
@@ -112,26 +110,17 @@ static wint_t readb() {
 
         res = select(fd_max + 1, &fdset, 0, 0, usecs_delay > 0 ? &tv : NULL);
         if (res == -1) {
-            switch (errno) {
-                case EINTR:
-                case EAGAIN: {
-                    if (interrupt_handler) {
-                        int res = interrupt_handler();
-                        if (res) {
-                            return res;
-                        }
-                        if (has_lookahead()) {
-                            return lookahead_pop();
-                        }
-                    }
+            if (errno == EINTR || errno == EAGAIN) {
+                if (interrupt_handler) {
+                    int res = interrupt_handler();
+                    if (res) return res;
+                    if (has_lookahead()) return lookahead_pop();
+                }
 
-                    do_loop = true;
-                    break;
-                }
-                default: {
-                    // The terminal has been closed. Save and exit.
-                    return R_EOF;
-                }
+                do_loop = true;
+            } else {
+                // The terminal has been closed. Save and exit.
+                return R_EOF;
             }
         } else {
             // Assume we loop unless we see a character in stdin.
@@ -169,9 +158,6 @@ static wint_t readb() {
     return arr[0];
 }
 
-// Directly set the input timeout.
-void set_wait_on_escape_ms(int ms) { wait_on_escape_ms = ms; }
-
 // Update the wait_on_escape_ms value in response to the fish_escape_delay_ms user variable being
 // set.
 void update_wait_on_escape_ms() {
@@ -181,13 +167,11 @@ void update_wait_on_escape_ms() {
         return;
     }
 
-    wchar_t *endptr;
-    long tmp = wcstol(escape_time_ms.c_str(), &endptr, 10);
-
-    if (*endptr != '\0' || tmp < 10 || tmp >= 5000) {
+    long tmp = fish_wcstol(escape_time_ms.c_str());
+    if (errno || tmp < 10 || tmp >= 5000) {
         fwprintf(stderr,
                  L"ignoring fish_escape_delay_ms: value '%ls' "
-                 "is not an integer or is < 10 or >= 5000 ms\n",
+                 L"is not an integer or is < 10 or >= 5000 ms\n",
                  escape_time_ms.c_str());
     } else {
         wait_on_escape_ms = (int)tmp;
@@ -203,7 +187,7 @@ wchar_t input_common_readch(int timed) {
             struct timeval tm = {wait_on_escape_ms / 1000, 1000 * (wait_on_escape_ms % 1000)};
             int count = select(1, &fds, 0, 0, &tm);
             if (count <= 0) {
-                return WEOF;
+                return R_TIMEOUT;
             }
         }
 
@@ -213,12 +197,12 @@ wchar_t input_common_readch(int timed) {
         while (1) {
             wint_t b = readb();
 
-            if (MB_CUR_MAX == 1)  // single-byte locale, all values are legal
-            {
-                return (unsigned char)b;
-            }
+            if (b >= R_NULL && b <= R_MAX) return b;
 
-            if ((b >= R_NULL) && (b < R_NULL + 1000)) return b;
+            if (MB_CUR_MAX == 1) {
+                // return (unsigned char)b;  // single-byte locale, all values are legal
+                return b;  // single-byte locale, all values are legal
+            }
 
             char bb = b;
             size_t sz = mbrtowc(&res, &bb, 1, &state);
@@ -240,7 +224,7 @@ wchar_t input_common_readch(int timed) {
         }
     } else {
         if (!timed) {
-            while (has_lookahead() && lookahead_front() == WEOF) lookahead_pop();
+            while (has_lookahead() && lookahead_front() == R_TIMEOUT) lookahead_pop();
             if (!has_lookahead()) return input_common_readch(0);
         }
 
@@ -252,22 +236,18 @@ void input_common_queue_ch(wint_t ch) { lookahead_push_back(ch); }
 
 void input_common_next_ch(wint_t ch) { lookahead_push_front(ch); }
 
-void input_common_add_callback(void (*callback)(void *), void *arg) {
+void input_common_add_callback(std::function<void(void)> callback) {
     ASSERT_IS_MAIN_THREAD();
-    callback_queue.push(callback_info_t(callback, arg));
+    callback_queue.push_back(std::move(callback));
 }
 
 static void input_flush_callbacks(void) {
-    // Nothing to do if nothing to do.
-    if (callback_queue.empty()) return;
-
     // We move the queue into a local variable, so that events queued up during a callback don't get
     // fired until next round.
+    ASSERT_IS_MAIN_THREAD();
     callback_queue_t local_queue;
     std::swap(local_queue, callback_queue);
-    while (!local_queue.empty()) {
-        const callback_info_t &callback = local_queue.front();
-        callback.first(callback.second);  // cute
-        local_queue.pop();
+    for (auto &f : local_queue) {
+        f();
     }
 }

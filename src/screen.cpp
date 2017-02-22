@@ -10,7 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+#include <wchar.h>
+
 #if HAVE_NCURSES_H
 #include <ncurses.h>
 #elif HAVE_NCURSES_CURSES_H
@@ -23,9 +26,7 @@
 #elif HAVE_NCURSES_TERM_H
 #include <ncurses/term.h>
 #endif
-#include <assert.h>
-#include <time.h>
-#include <wchar.h>
+
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -47,6 +48,8 @@
 
 /// A helper value for an invalid location.
 #define INVALID_LOCATION (screen_data_t::cursor_t(-1, -1))
+
+enum prompt_type_t { UNKNOWN_PROMPT, LEFT_PROMPT, RIGHT_PROMPT };
 
 static void invalidate_soft_wrap(screen_t *scr);
 
@@ -75,6 +78,9 @@ class scoped_buffer_t {
     }
 };
 
+// Singleton of the cached escape sequences seen in prompts and similar strings.
+cached_esc_sequences_t cached_esc_sequences = cached_esc_sequences_t();
+
 /// Tests if the specified narrow character sequence is present at the specified position of the
 /// specified wide character string. All of \c seq must match, but str may be longer than seq.
 static size_t try_sequence(const char *seq, const wchar_t *str) {
@@ -83,7 +89,8 @@ static size_t try_sequence(const char *seq, const wchar_t *str) {
         if (seq[i] != str[i]) return 0;
     }
 
-    return 0;
+    DIE("unexpectedly fell off end of try_sequence()");
+    return 0;  // this should never be executed
 }
 
 /// Returns the number of columns left until the next tab stop, given the current cursor postion.
@@ -105,24 +112,29 @@ static bool allow_soft_wrap(void) {
 
 /// Does this look like the escape sequence for setting a screen name.
 static bool is_screen_name_escape_seq(const wchar_t *code, size_t *resulting_length) {
-    bool found = false;
-    if (code[1] == L'k') {
-        const env_var_t term_name = env_get_string(L"TERM");
-        if (!term_name.missing() && string_prefixes_string(L"screen", term_name)) {
-            const wchar_t *const screen_name_end_sentinel = L"\x1b\\";
-            const wchar_t *screen_name_end = wcsstr(&code[2], screen_name_end_sentinel);
-            if (screen_name_end == NULL) {
-                // Consider just <esc>k to be the code.
-                *resulting_length = 2;
-            } else {
-                const wchar_t *escape_sequence_end =
-                    screen_name_end + wcslen(screen_name_end_sentinel);
-                *resulting_length = escape_sequence_end - code;
-            }
-            found = true;
-        }
+    if (code[1] != L'k') {
+        return false;
     }
-    return found;
+
+#if 0
+    // TODO: Decide if this should be removed or modified to also test for TERM values that begin
+    // with "tmux". See issue #3512.
+    const env_var_t term_name = env_get_string(L"TERM");
+    if (term_name.missing() || !string_prefixes_string(L"screen", term_name)) {
+        return false;
+    }
+#endif
+
+    const wchar_t *const screen_name_end_sentinel = L"\e\\";
+    const wchar_t *screen_name_end = wcsstr(&code[2], screen_name_end_sentinel);
+    if (screen_name_end == NULL) {
+        // Consider just <esc>k to be the code.
+        *resulting_length = 2;
+    } else {
+        const wchar_t *escape_sequence_end = screen_name_end + wcslen(screen_name_end_sentinel);
+        *resulting_length = escape_sequence_end - code;
+    }
+    return true;
 }
 
 /// iTerm2 escape codes: CSI followed by ], terminated by either BEL or escape + backslash.
@@ -134,7 +146,7 @@ static bool is_iterm2_escape_seq(const wchar_t *code, size_t *resulting_length) 
         size_t cursor = 2;
         for (; code[cursor] != L'\0'; cursor++) {
             // Consume a sequence of characters up to <esc>\ or <bel>.
-            if (code[cursor] == '\x07' || (code[cursor] == '\\' && code[cursor - 1] == '\x1b')) {
+            if (code[cursor] == '\x07' || (code[cursor] == '\\' && code[cursor - 1] == '\e')) {
                 found = true;
                 break;
             }
@@ -169,121 +181,137 @@ static bool is_two_byte_escape_seq(const wchar_t *code, size_t *resulting_length
 /// Generic VT100 CSI-style sequence. <esc>, followed by zero or more ASCII characters NOT in
 /// the range [@,_], followed by one character in that range.
 static bool is_csi_style_escape_seq(const wchar_t *code, size_t *resulting_length) {
-    bool found = false;
-    if (code[1] == L'[') {
-        // Start at 2 to skip over <esc>[
-        size_t cursor = 2;
-        for (; code[cursor] != L'\0'; cursor++) {
-            // Consume a sequence of ASCII characters not in the range [@, ~].
-            wchar_t widechar = code[cursor];
-
-            // If we're not in ASCII, just stop.
-            if (widechar > 127) break;
-
-            // If we're the end character, then consume it and then stop.
-            if (widechar >= L'@' && widechar <= L'~') {
-                cursor++;
-                break;
-            }
-        }
-        // curs now indexes just beyond the end of the sequence (or at the terminating zero).
-        found = true;
-        *resulting_length = cursor;
+    if (code[1] != L'[') {
+        return false;
     }
-    return found;
+
+    // Start at 2 to skip over <esc>[
+    size_t cursor = 2;
+    for (; code[cursor] != L'\0'; cursor++) {
+        // Consume a sequence of ASCII characters not in the range [@, ~].
+        wchar_t widechar = code[cursor];
+
+        // If we're not in ASCII, just stop.
+        if (widechar > 127) break;
+
+        // If we're the end character, then consume it and then stop.
+        if (widechar >= L'@' && widechar <= L'~') {
+            cursor++;
+            break;
+        }
+    }
+    // cursor now indexes just beyond the end of the sequence (or at the terminating zero).
+    *resulting_length = cursor;
+    return true;
 }
 
-/// Returns the number of characters in the escape code starting at 'code' (which should initially
-/// contain \x1b).
+/// Detect whether the escape sequence sets foreground/background color. Note that 24-bit color
+/// sequences are detected by `is_csi_style_escape_seq()` if they use the ANSI X3.64 pattern for
+/// such sequences. This function only handles those escape sequences for setting color that rely on
+/// the terminfo definition and which might use a different pattern.
+static bool is_color_escape_seq(const wchar_t *code, size_t *resulting_length) {
+    if (!cur_term) return false;
+
+    // Detect these terminfo color escapes with parameter value up to max_colors, all of which
+    // don't move the cursor.
+    char *const esc[] = {
+        set_a_foreground, set_a_background, set_foreground, set_background,
+    };
+
+    for (size_t p = 0; p < sizeof esc / sizeof *esc; p++) {
+        if (!esc[p]) continue;
+
+        for (int k = 0; k < max_colors; k++) {
+            size_t esc_seq_len = try_sequence(tparm(esc[p], k), code);
+            if (esc_seq_len) {
+                *resulting_length = esc_seq_len;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+/// Detect whether the escape sequence sets one of the terminal attributes that affects how text is
+/// displayed other than the color.
+static bool is_visual_escape_seq(const wchar_t *code, size_t *resulting_length) {
+    if (!cur_term) return false;
+    char *const esc2[] = {
+        enter_bold_mode,      exit_attribute_mode,    enter_underline_mode,  exit_underline_mode,
+        enter_standout_mode,  exit_standout_mode,     flash_screen,          enter_subscript_mode,
+        exit_subscript_mode,  enter_superscript_mode, exit_superscript_mode, enter_blink_mode,
+        enter_italics_mode,   exit_italics_mode,      enter_reverse_mode,    enter_shadow_mode,
+        exit_shadow_mode,     enter_standout_mode,    exit_standout_mode,    enter_secure_mode,
+        enter_dim_mode,       enter_blink_mode,       enter_protected_mode,  enter_alt_charset_mode,
+        exit_alt_charset_mode};
+
+    for (size_t p = 0; p < sizeof esc2 / sizeof *esc2; p++) {
+        if (!esc2[p]) continue;
+        // Test both padded and unpadded version, just to be safe. Most versions of tparm don't
+        // actually seem to do anything these days.
+        size_t esc_seq_len = maxi(try_sequence(tparm(esc2[p]), code), try_sequence(esc2[p], code));
+        if (esc_seq_len) {
+            *resulting_length = esc_seq_len;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/// Returns the number of characters in the escape code starting at 'code'. We only handle sequences
+/// that begin with \e. If it doesn't we return zero. We also return zero if we don't recognize the
+/// escape sequence based on querying terminfo and other heuristics.
 size_t escape_code_length(const wchar_t *code) {
     assert(code != NULL);
+    if (*code != L'\e') return 0;
 
-    // The only escape codes we recognize start with \x1b.
-    if (code[0] != L'\x1b') return 0;
+    size_t esc_seq_len = cached_esc_sequences.find_entry(code);
+    if (esc_seq_len) return esc_seq_len;
 
-    size_t resulting_length = 0;
-    bool found = false;
-
-    if (cur_term != NULL) {
-        // Detect these terminfo color escapes with parameter value 0..7, all of which don't move
-        // the cursor.
-        char *const esc[] = {
-            set_a_foreground, set_a_background, set_foreground, set_background,
-        };
-
-        for (size_t p = 0; p < sizeof esc / sizeof *esc && !found; p++) {
-            if (!esc[p]) continue;
-
-            for (size_t k = 0; k < 8; k++) {
-                size_t len = try_sequence(tparm(esc[p], k), code);
-                if (len) {
-                    resulting_length = len;
-                    found = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (cur_term != NULL) {
-        // Detect these semi-common terminfo escapes without any parameter values, all of which
-        // don't move the cursor.
-        char *const esc2[] = {enter_bold_mode,        exit_attribute_mode,   enter_underline_mode,
-                              exit_underline_mode,    enter_standout_mode,   exit_standout_mode,
-                              flash_screen,           enter_subscript_mode,  exit_subscript_mode,
-                              enter_superscript_mode, exit_superscript_mode, enter_blink_mode,
-                              enter_italics_mode,     exit_italics_mode,     enter_reverse_mode,
-                              enter_shadow_mode,      exit_shadow_mode,      enter_standout_mode,
-                              exit_standout_mode,     enter_secure_mode};
-
-        for (size_t p = 0; p < sizeof esc2 / sizeof *esc2 && !found; p++) {
-            if (!esc2[p]) continue;
-            // Test both padded and unpadded version, just to be safe. Most versions of tparm don't
-            // actually seem to do anything these days.
-            size_t len = maxi(try_sequence(tparm(esc2[p]), code), try_sequence(esc2[p], code));
-            if (len) {
-                resulting_length = len;
-                found = true;
-            }
-        }
-    }
-
-    if (!found) found = is_screen_name_escape_seq(code, &resulting_length);
-    if (!found) found = is_iterm2_escape_seq(code, &resulting_length);
-    if (!found) found = is_single_byte_escape_seq(code, &resulting_length);
-    if (!found) found = is_csi_style_escape_seq(code, &resulting_length);
-    if (!found) is_two_byte_escape_seq(code, &resulting_length);
-
-    return resulting_length;
+    bool found = is_color_escape_seq(code, &esc_seq_len);
+    if (!found) found = is_visual_escape_seq(code, &esc_seq_len);
+    if (!found) found = is_screen_name_escape_seq(code, &esc_seq_len);
+    if (!found) found = is_iterm2_escape_seq(code, &esc_seq_len);
+    if (!found) found = is_single_byte_escape_seq(code, &esc_seq_len);
+    if (!found) found = is_csi_style_escape_seq(code, &esc_seq_len);
+    if (!found) found = is_two_byte_escape_seq(code, &esc_seq_len);
+    if (found) cached_esc_sequences.add_entry(code, esc_seq_len);
+    return esc_seq_len;
 }
 
-// Information about a prompt layout.
+// Information about the layout of a prompt.
 struct prompt_layout_t {
-    // How many lines the prompt consumes.
-    size_t line_count;
-    // Width of the longest line.
-    size_t max_line_width;
-    // Width of the last line.
-    size_t last_line_width;
+    size_t line_count;       // how many lines the prompt consumes
+    size_t max_line_width;   // width of the longest line
+    size_t last_line_width;  // width of the last line
 };
 
+// These are used by `calc_prompt_layout()` to avoid redundant calculations.
+static const wchar_t *cached_left_prompt = wcsdup(L"");
+static const wchar_t *cached_right_prompt = wcsdup(L"");
+static prompt_layout_t cached_left_prompt_layout = {1, 0, 0};
+static prompt_layout_t cached_right_prompt_layout = {1, 0, 0};
+
 /// Calculate layout information for the given prompt. Does some clever magic to detect common
-/// escape sequences that may be embeded in a prompt, such as color codes.
-static prompt_layout_t calc_prompt_layout(const wchar_t *prompt) {
+/// escape sequences that may be embeded in a prompt, such as those to set visual attributes.
+static prompt_layout_t calc_prompt_layout(const wchar_t *prompt, prompt_type_t which_prompt) {
+    if (which_prompt == LEFT_PROMPT && wcscmp(cached_left_prompt, prompt) == 0) {
+        return cached_left_prompt_layout;
+    }
+    if (which_prompt == RIGHT_PROMPT && wcscmp(cached_right_prompt, prompt) == 0) {
+        return cached_right_prompt_layout;
+    }
+
+    prompt_layout_t prompt_layout = {1, 0, 0};
     size_t current_line_width = 0;
-    size_t j;
 
-    prompt_layout_t prompt_layout = {};
-    prompt_layout.line_count = 1;
-
-    for (j = 0; prompt[j]; j++) {
-        if (prompt[j] == L'\x1b') {
-            // This is the start of an escape code. Skip over it if it's at least one character
-            // long.
-            size_t escape_len = escape_code_length(&prompt[j]);
-            if (escape_len > 0) {
-                j += escape_len - 1;
-            }
+    for (int j = 0; prompt[j]; j++) {
+        if (prompt[j] == L'\e') {
+            // This is the start of an escape code. Skip over it if it's at least one char long.
+            size_t len = escape_code_length(&prompt[j]);
+            if (len > 0) j += len - 1;
         } else if (prompt[j] == L'\t') {
             current_line_width = next_tab_stop(current_line_width);
         } else if (prompt[j] == L'\n' || prompt[j] == L'\f') {
@@ -294,13 +322,25 @@ static prompt_layout_t calc_prompt_layout(const wchar_t *prompt) {
         } else if (prompt[j] == L'\r') {
             current_line_width = 0;
         } else {
-            // Ordinary decent character. Just add width. This returns -1 for a control character -
-            // don't add that.
+            // Ordinary char. Add its width with care to ignore control chars which have width -1.
             current_line_width += fish_wcwidth_min_0(prompt[j]);
-            prompt_layout.max_line_width = maxi(prompt_layout.max_line_width, current_line_width);
+            if (current_line_width > prompt_layout.max_line_width) {
+                prompt_layout.max_line_width = current_line_width;
+            }
         }
     }
+
     prompt_layout.last_line_width = current_line_width;
+    if (which_prompt == LEFT_PROMPT) {
+        free((void *)cached_left_prompt);
+        cached_left_prompt = wcsdup(prompt);
+        cached_left_prompt_layout = prompt_layout;
+    }
+    if (which_prompt == RIGHT_PROMPT) {
+        free((void *)cached_right_prompt);
+        cached_right_prompt = wcsdup(prompt);
+        cached_right_prompt_layout = prompt_layout;
+    }
     return prompt_layout;
 }
 
@@ -310,7 +350,7 @@ static size_t calc_prompt_lines(const wcstring &prompt) {
     // calc_prompt_width_and_lines.
     size_t result = 1;
     if (prompt.find(L'\n') != wcstring::npos || prompt.find(L'\f') != wcstring::npos) {
-        result = calc_prompt_layout(prompt.c_str()).line_count;
+        result = calc_prompt_layout(prompt.c_str(), UNKNOWN_PROMPT).line_count;
     }
     return result;
 }
@@ -387,13 +427,12 @@ static void s_desired_append_char(screen_t *s, wchar_t b, int c, int indent, siz
     int line_no = s->desired.cursor.y;
 
     if (b == L'\n') {
-        int i;
         // Current line is definitely hard wrapped.
         s->desired.create_line(s->desired.line_count());
         s->desired.line(s->desired.cursor.y).is_soft_wrapped = false;
         s->desired.cursor.y++;
         s->desired.cursor.x = 0;
-        for (i = 0; i < prompt_width + indent * INDENT_STEP; i++) {
+        for (size_t i = 0; i < prompt_width + indent * INDENT_STEP; i++) {
             s_desired_append_char(s, L' ', 0, indent, prompt_width);
         }
     } else if (b == L'\r') {
@@ -410,7 +449,7 @@ static void s_desired_append_char(screen_t *s, wchar_t b, int c, int indent, siz
         if ((s->desired.cursor.x + cw) > screen_width) {
             // Current line is soft wrapped (assuming we support it).
             s->desired.line(s->desired.cursor.y).is_soft_wrapped = true;
-            // fprintf(stderr, "\n\n1 Soft wrapping %d\n\n", s->desired.cursor.y);
+            // fwprintf(stderr, L"\n\n1 Soft wrapping %d\n\n", s->desired.cursor.y);
 
             line_no = (int)s->desired.line_count();
             s->desired.add_line();
@@ -528,6 +567,7 @@ static void s_move(screen_t *s, data_buffer_t *b, int new_x, int new_y) {
 
 /// Set the pen color for the terminal.
 static void s_set_color(screen_t *s, data_buffer_t *b, highlight_spec_t c) {
+    UNUSED(s);
     scoped_buffer_t scoped_buffer(b);
 
     unsigned int uc = (unsigned int)c;
@@ -603,9 +643,8 @@ static bool perform_any_impending_soft_wrap(screen_t *scr, int x, int y) {
 /// Make sure we don't soft wrap.
 static void invalidate_soft_wrap(screen_t *scr) { scr->soft_wrap_location = INVALID_LOCATION; }
 
-// Various code for testing term behavior.
-
 #if 0
+/// Various code for testing term behavior.
 static bool test_stuff(screen_t *scr)
 {
     data_buffer_t output;
@@ -655,7 +694,7 @@ static bool test_stuff(screen_t *scr)
         int c = getchar();
         if (c != EOF) break;
     }
-    puts("Bye");
+    fwprintf(stdout, L"Bye\n");
     exit(0);
     while (1) sleep(10000);
     return true;
@@ -665,8 +704,9 @@ static bool test_stuff(screen_t *scr)
 /// Update the screen to match the desired output.
 static void s_update(screen_t *scr, const wchar_t *left_prompt, const wchar_t *right_prompt) {
     // if (test_stuff(scr)) return;
-    const size_t left_prompt_width = calc_prompt_layout(left_prompt).last_line_width;
-    const size_t right_prompt_width = calc_prompt_layout(right_prompt).last_line_width;
+    const size_t left_prompt_width = calc_prompt_layout(left_prompt, LEFT_PROMPT).last_line_width;
+    const size_t right_prompt_width =
+        calc_prompt_layout(right_prompt, RIGHT_PROMPT).last_line_width;
 
     int screen_width = common_get_width();
 
@@ -732,7 +772,7 @@ static void s_update(screen_t *scr, const wchar_t *left_prompt, const wchar_t *r
             // avoid repeatedly outputting it.
             const size_t shared_prefix = line_shared_prefix(o_line, s_line);
             if (shared_prefix > 0) {
-                int prefix_width = fish_wcswidth(&o_line.text.at(0), shared_prefix);
+                size_t prefix_width = fish_wcswidth(&o_line.text.at(0), shared_prefix);
                 if (prefix_width > skip_remaining) skip_remaining = prefix_width;
             }
 
@@ -754,7 +794,7 @@ static void s_update(screen_t *scr, const wchar_t *left_prompt, const wchar_t *r
         // Skip over skip_remaining width worth of characters.
         size_t j = 0;
         for (; j < o_line.size(); j++) {
-            int width = fish_wcwidth_min_0(o_line.char_at(j));
+            size_t width = fish_wcwidth_min_0(o_line.char_at(j));
             if (skip_remaining < width) break;
             skip_remaining -= width;
             current_width += width;
@@ -772,7 +812,8 @@ static void s_update(screen_t *scr, const wchar_t *left_prompt, const wchar_t *r
             // the screen after we output into the last column, it can erase the last character due
             // to the sticky right cursor. If we clear the screen too early, we can defeat soft
             // wrapping.
-            if (j + 1 == screen_width && should_clear_screen_this_line && !has_cleared_screen) {
+            if (j + 1 == (size_t)screen_width && should_clear_screen_this_line &&
+                !has_cleared_screen) {
                 s_move(scr, &output, current_width, (int)i);
                 s_write_mbs(&output, clr_eos);
                 has_cleared_screen = true;
@@ -815,7 +856,7 @@ static void s_update(screen_t *scr, const wchar_t *left_prompt, const wchar_t *r
         }
 
         // Output any rprompt if this is the first line.
-        if (i == 0 && right_prompt_width > 0) {
+        if (i == 0 && right_prompt_width > 0) {  //!OCLINT(Use early exit/continue)
             s_move(scr, &output, (int)(screen_width - right_prompt_width), (int)i);
             s_set_color(scr, &output, 0xffffffff);
             s_write_str(&output, right_prompt);
@@ -893,6 +934,7 @@ static screen_layout_t compute_layout(screen_t *s, size_t screen_width,
                                       const wcstring &left_prompt_str,
                                       const wcstring &right_prompt_str, const wcstring &commandline,
                                       const wcstring &autosuggestion_str, const int *indent) {
+    UNUSED(s);
     screen_layout_t result = {};
 
     // Start by ensuring that the prompts themselves can fit.
@@ -900,8 +942,8 @@ static screen_layout_t compute_layout(screen_t *s, size_t screen_width,
     const wchar_t *right_prompt = right_prompt_str.c_str();
     const wchar_t *autosuggestion = autosuggestion_str.c_str();
 
-    prompt_layout_t left_prompt_layout = calc_prompt_layout(left_prompt);
-    prompt_layout_t right_prompt_layout = calc_prompt_layout(right_prompt);
+    prompt_layout_t left_prompt_layout = calc_prompt_layout(left_prompt, LEFT_PROMPT);
+    prompt_layout_t right_prompt_layout = calc_prompt_layout(right_prompt, RIGHT_PROMPT);
 
     size_t left_prompt_width = left_prompt_layout.last_line_width;
     size_t right_prompt_width = right_prompt_layout.last_line_width;
@@ -1039,7 +1081,6 @@ void s_write(screen_t *s, const wcstring &left_prompt, const wcstring &right_pro
              const int *indent, size_t cursor_pos, const page_rendering_t &pager,
              bool cursor_is_within_pager) {
     screen_data_t::cursor_t cursor_arr;
-
     CHECK(s, );
     CHECK(indent, );
 
@@ -1126,7 +1167,6 @@ void s_write(screen_t *s, const wcstring &left_prompt, const wcstring &right_pro
     s_update(s, layout.left_prompt.c_str(), layout.right_prompt.c_str());
     s_save_status(s);
 }
-
 void s_reset(screen_t *s, screen_reset_mode_t mode) {
     CHECK(s, );
 
@@ -1189,28 +1229,53 @@ void s_reset(screen_t *s, screen_reset_mode_t mode) {
         // Don't need to check for fish_wcwidth errors; this is done when setting up
         // omitted_newline_char in common.cpp.
         int non_space_width = fish_wcwidth(omitted_newline_char);
-        if (screen_width >= non_space_width) {
-            bool has_256_colors = output_get_color_support() & color_support_term256;
-            if (has_256_colors) {
-                // Draw the string in term256 gray.
-                abandon_line_string.append(L"\x1b[38;5;245m");
-            } else {
-                // Draw in "bright black" (gray).
-                abandon_line_string.append(
-                    L"\x1b[0m"       // bright
-                    L"\x1b[30;1m");  // black
+        // We do `>` rather than `>=` because the code below might require one extra space.
+        if (screen_width > non_space_width) {
+            bool justgrey = true;
+            if (enter_dim_mode) {
+                std::string dim = tparm(enter_dim_mode);
+                if (!dim.empty()) {
+                    // Use dim if they have it, so the color will be based on their actual normal
+                    // color and the background of the termianl.
+                    abandon_line_string.append(str2wcstring(dim));
+                    justgrey = false;
+                }
+            }
+            if (justgrey && set_a_foreground) {
+                if (max_colors >= 238) {
+                    // draw the string in a particular grey
+                    abandon_line_string.append(str2wcstring(tparm(set_a_foreground, 237)));
+                } else if (max_colors >= 9) {
+                    // bright black (the ninth color, looks grey)
+                    abandon_line_string.append(str2wcstring(tparm(set_a_foreground, 8)));
+                } else if (max_colors >= 2 && enter_bold_mode) {
+                    // we might still get that color by setting black and going bold for bright
+                    abandon_line_string.append(str2wcstring(tparm(enter_bold_mode)));
+                    abandon_line_string.append(str2wcstring(tparm(set_a_foreground, 0)));
+                }
             }
             abandon_line_string.push_back(omitted_newline_char);
-            abandon_line_string.append(L"\x1b[0m");  // normal text ANSI escape sequence
-            abandon_line_string.append(screen_width - non_space_width, L' ');
+
+            if (exit_attribute_mode) {
+                abandon_line_string.append(
+                    str2wcstring(tparm(exit_attribute_mode)));  // normal text ANSI escape sequence
+            }
+            int newline_glitch_width = term_has_xn ? 0 : 1;
+            abandon_line_string.append(screen_width - non_space_width - newline_glitch_width, L' ');
         }
         abandon_line_string.push_back(L'\r');
+        abandon_line_string.push_back(omitted_newline_char);
         // Now we are certainly on a new line. But we may have dropped the omitted newline char on
         // it. So append enough spaces to overwrite the omitted newline char, and then clear all the
-        // spaces from the new line
+        // spaces from the new line.
         abandon_line_string.append(non_space_width, L' ');
         abandon_line_string.push_back(L'\r');
-        abandon_line_string.append(L"\x1b[2K");
+        // Clear entire line. Zsh doesn't do this. Fish added this with commit 4417a6ee: If you have
+        // a prompt preceded by a new line, you'll get a line full of spaces instead of an empty
+        // line above your prompt. This doesn't make a difference in normal usage, but copying and
+        // pasting your terminal log becomes a pain. This commit clears that line, making it an
+        // actual empty line.
+        abandon_line_string.append(L"\e[2K");
 
         const std::string narrow_abandon_line_string = wcs2string(abandon_line_string);
         write_loop(STDOUT_FILENO, narrow_abandon_line_string.c_str(),

@@ -1,7 +1,7 @@
 // Wide character equivalents of various standard unix functions.
+#define FISH_NO_ISW_WRAPPERS
 #include "config.h"
 
-#include <assert.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -15,8 +15,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <wchar.h>
+#include <wctype.h>
+
 #include <map>
-#include <memory>
 #include <string>
 
 #include "common.h"
@@ -36,12 +37,8 @@ const file_id_t kInvalidFileID = {(dev_t)-1LL, (ino_t)-1LL, (uint64_t)-1LL, -1, 
 #endif
 #endif
 
-/// Lock to protect wgettext.
-static pthread_mutex_t wgettext_lock;
-
 /// Map used as cache by wgettext.
-typedef std::map<wcstring, wcstring> wgettext_map_t;
-static wgettext_map_t wgettext_map;
+static owning_lock<std::map<wcstring, wcstring>> wgettext_map;
 
 bool wreaddir_resolving(DIR *dir, const std::wstring &dir_path, std::wstring &out_name,
                         bool *out_is_dir) {
@@ -49,40 +46,39 @@ bool wreaddir_resolving(DIR *dir, const std::wstring &dir_path, std::wstring &ou
     if (!d) return false;
 
     out_name = str2wcstring(d->d_name);
-    if (out_is_dir) {
-        // The caller cares if this is a directory, so check.
-        bool is_dir = false;
+    if (!out_is_dir) return true;
 
-        // We may be able to skip stat, if the readdir can tell us the file type directly.
-        bool check_with_stat = true;
+    // The caller cares if this is a directory, so check.
+    bool is_dir = false;
+    // We may be able to skip stat, if the readdir can tell us the file type directly.
+    bool check_with_stat = true;
 #ifdef HAVE_STRUCT_DIRENT_D_TYPE
-        if (d->d_type == DT_DIR) {
-            // Known directory.
-            is_dir = true;
-            check_with_stat = false;
-        } else if (d->d_type == DT_LNK || d->d_type == DT_UNKNOWN) {
-            // We want to treat symlinks to directories as directories. Use stat to resolve it.
-            check_with_stat = true;
-        } else {
-            // Regular file.
-            is_dir = false;
-            check_with_stat = false;
-        }
-#endif  // HAVE_STRUCT_DIRENT_D_TYPE
-        if (check_with_stat) {
-            // We couldn't determine the file type from the dirent; check by stat'ing it.
-            cstring fullpath = wcs2string(dir_path);
-            fullpath.push_back('/');
-            fullpath.append(d->d_name);
-            struct stat buf;
-            if (stat(fullpath.c_str(), &buf) != 0) {
-                is_dir = false;
-            } else {
-                is_dir = !!(S_ISDIR(buf.st_mode));
-            }
-        }
-        *out_is_dir = is_dir;
+    if (d->d_type == DT_DIR) {
+        // Known directory.
+        is_dir = true;
+        check_with_stat = false;
+    } else if (d->d_type == DT_LNK || d->d_type == DT_UNKNOWN) {
+        // We want to treat symlinks to directories as directories. Use stat to resolve it.
+        check_with_stat = true;
+    } else {
+        // Regular file.
+        is_dir = false;
+        check_with_stat = false;
     }
+#endif  // HAVE_STRUCT_DIRENT_D_TYPE
+    if (check_with_stat) {
+        // We couldn't determine the file type from the dirent; check by stat'ing it.
+        cstring fullpath = wcs2string(dir_path);
+        fullpath.push_back('/');
+        fullpath.append(d->d_name);
+        struct stat buf;
+        if (stat(fullpath.c_str(), &buf) != 0) {
+            is_dir = false;
+        } else {
+            is_dir = static_cast<bool>(S_ISDIR(buf.st_mode));
+        }
+    }
+    *out_is_dir = is_dir;
     return true;
 }
 
@@ -185,11 +181,11 @@ bool set_cloexec(int fd) {
     int flags = fcntl(fd, F_GETFD, 0);
     if (flags < 0) {
         return false;
-    } else if (flags & FD_CLOEXEC) {
-        return true;
-    } else {
-        return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) >= 0;
     }
+    if (flags & FD_CLOEXEC) {
+        return true;
+    }
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) >= 0;
 }
 
 static int wopen_internal(const wcstring &pathname, int flags, mode_t mode, bool cloexec) {
@@ -331,23 +327,45 @@ void safe_perror(const char *message) {
     errno = err;
 }
 
-#ifdef HAVE_REALPATH_NULL
-
 wchar_t *wrealpath(const wcstring &pathname, wchar_t *resolved_path) {
+    if (pathname.size() == 0) return NULL;
+
+    cstring real_path("");
     cstring narrow_path = wcs2string(pathname);
-    char *narrow_res = realpath(narrow_path.c_str(), NULL);
 
-    if (!narrow_res) return NULL;
-
-    wchar_t *res;
-    wcstring wide_res = str2wcstring(narrow_res);
-    if (resolved_path) {
-        wcslcpy(resolved_path, wide_res.c_str(), PATH_MAX);
-        res = resolved_path;
-    } else {
-        res = wcsdup(wide_res.c_str());
+    // Strip trailing slashes. This is needed to be bug-for-bug compatible with GNU realpath which
+    // treats "/a//" as equivalent to "/a" whether or not /a exists.
+    while (narrow_path.size() > 1 && narrow_path.at(narrow_path.size() - 1) == '/') {
+        narrow_path.erase(narrow_path.size() - 1, 1);
     }
 
+    char *narrow_res = realpath(narrow_path.c_str(), NULL);
+    if (narrow_res) {
+        real_path.append(narrow_res);
+    } else {
+        size_t pathsep_idx = narrow_path.rfind('/');
+        if (pathsep_idx == 0) {
+            // If the only pathsep is the first character then it's an absolute path with a
+            // single path component and thus doesn't need conversion.
+            real_path = narrow_path;
+        } else {
+            if (pathsep_idx == cstring::npos) {
+                // No pathsep means a single path component relative to pwd.
+                narrow_res = realpath(".", NULL);
+                assert(narrow_res != NULL);
+                pathsep_idx = 0;
+            } else {
+                // Only call realpath() on the portion up to the last component.
+                narrow_res = realpath(narrow_path.substr(0, pathsep_idx).c_str(), NULL);
+                if (!narrow_res) return NULL;
+                pathsep_idx++;
+            }
+            real_path.append(narrow_res);
+            // This test is to deal with pathological cases such as /../../x => //x.
+            if (real_path.size() > 1) real_path.append("/");
+            real_path.append(narrow_path.substr(pathsep_idx, cstring::npos));
+        }
+    }
 #if __APPLE__ && __DARWIN_C_LEVEL < 200809L
 // OS X Snow Leopard is broken with respect to the dynamically allocated buffer returned by
 // realpath(). It's not dynamically allocated so attempting to free that buffer triggers a
@@ -356,30 +374,13 @@ wchar_t *wrealpath(const wcstring &pathname, wchar_t *resolved_path) {
     free(narrow_res);
 #endif
 
-    return res;
-}
-
-#else
-
-wchar_t *wrealpath(const wcstring &pathname, wchar_t *resolved_path) {
-    cstring tmp = wcs2string(pathname);
-    char narrow_buff[PATH_MAX];
-    char *narrow_res = realpath(tmp.c_str(), narrow_buff);
-    wchar_t *res;
-
-    if (!narrow_res) return 0;
-
-    const wcstring wide_res = str2wcstring(narrow_res);
+    wcstring wreal_path = str2wcstring(real_path);
     if (resolved_path) {
-        wcslcpy(resolved_path, wide_res.c_str(), PATH_MAX);
-        res = resolved_path;
-    } else {
-        res = wcsdup(wide_res.c_str());
+        wcslcpy(resolved_path, wreal_path.c_str(), PATH_MAX);
+        return resolved_path;
     }
-    return res;
+    return wcsdup(wreal_path.c_str());
 }
-
-#endif
 
 wcstring wdirname(const wcstring &path) {
     char *tmp = wcs2str(path.c_str());
@@ -399,7 +400,6 @@ wcstring wbasename(const wcstring &path) {
 
 // Really init wgettext.
 static void wgettext_really_init() {
-    pthread_mutex_init(&wgettext_lock, NULL);
     fish_bindtextdomain(PACKAGE_NAME, LOCALEDIR);
     fish_textdomain(PACKAGE_NAME);
 }
@@ -417,8 +417,8 @@ const wcstring &wgettext(const wchar_t *in) {
     wcstring key = in;
 
     wgettext_init_if_necessary();
-    scoped_lock locker(wgettext_lock);
-    wcstring &val = wgettext_map[key];
+    auto wmap = wgettext_map.acquire();
+    wcstring &val = wmap.value[key];
     if (val.empty()) {
         cstring mbs_in = wcs2string(key);
         char *out = fish_gettext(mbs_in.c_str());
@@ -442,16 +442,214 @@ int wrename(const wcstring &old, const wcstring &newv) {
     return rename(old_narrow.c_str(), new_narrow.c_str());
 }
 
-int fish_wcstoi(const wchar_t *str, wchar_t **endptr, int base) {
-    long ret = wcstol(str, endptr, base);
-    if (ret > INT_MAX) {
-        ret = INT_MAX;
+/// Return one if the code point is in a Unicode private use area.
+int fish_is_pua(wint_t wc) {
+    if (PUA1_START <= wc && wc < PUA1_END) return 1;
+    if (PUA2_START <= wc && wc < PUA2_END) return 1;
+    if (PUA3_START <= wc && wc < PUA3_END) return 1;
+    return 0;
+}
+
+/// We need this because there are too many implementations that don't return the proper answer for
+/// some code points. See issue #3050.
+int fish_iswalnum(wint_t wc) {
+    if (fish_reserved_codepoint(wc)) return 0;
+    if (fish_is_pua(wc)) return 0;
+    return iswalnum(wc);
+}
+
+/// We need this because there are too many implementations that don't return the proper answer for
+/// some code points. See issue #3050.
+int fish_iswalpha(wint_t wc) {
+    if (fish_reserved_codepoint(wc)) return 0;
+    if (fish_is_pua(wc)) return 0;
+    return iswalpha(wc);
+}
+
+/// We need this because there are too many implementations that don't return the proper answer for
+/// some code points. See issue #3050.
+int fish_iswgraph(wint_t wc) {
+    if (fish_reserved_codepoint(wc)) return 0;
+    if (fish_is_pua(wc)) return 1;
+    return iswgraph(wc);
+}
+
+/// Test if the given string is a valid variable name.
+///
+/// \return null if this is a valid name, and a pointer to the first invalid character otherwise.
+const wchar_t *wcsvarname(const wchar_t *str) {
+    if (str[0] == L'\0') return str;
+    while (*str) {
+        if ((!fish_iswalnum(*str)) && (*str != L'_')) {
+            return str;
+        }
+        str++;
+    }
+    return NULL;
+}
+
+/// Test if the given string is a valid variable name.
+///
+/// \return null if this is a valid name, and a pointer to the first invalid character otherwise.
+const wchar_t *wcsvarname(const wcstring &str) { return wcsvarname(str.c_str()); }
+
+/// Test if the string is a valid function name.
+///
+/// \return true if it is valid else false.
+bool wcsfuncname(const wcstring &str) {
+    if (str.size() == 0) return false;
+    if (str.at(0) == L'-') return false;
+    if (str.find_first_of(L'/') != wcstring::npos) return false;
+    return true;
+}
+
+/// Test if the given string is valid in a variable name.
+///
+/// \return true if this is a valid name, false otherwise.
+bool wcsvarchr(wchar_t chr) { return fish_iswalnum(chr) || chr == L'_'; }
+
+/// Convenience variants on fish_wcwswidth().
+///
+/// See fallback.h for the normal definitions.
+int fish_wcswidth(const wchar_t *str) { return fish_wcswidth(str, wcslen(str)); }
+
+/// Convenience variants on fish_wcwswidth().
+///
+/// See fallback.h for the normal definitions.
+int fish_wcswidth(const wcstring &str) { return fish_wcswidth(str.c_str(), str.size()); }
+
+/// Like fish_wcstol(), but fails on a value outside the range of an int.
+///
+/// This is needed because BSD and GNU implementations differ in several ways that make it really
+/// annoying to use them in a portable fashion.
+///
+/// The caller doesn't have to zero errno. Sets errno to -1 if the int ends with something other
+/// than a digit. Leading whitespace is ignored (per the base wcstol implementation). Trailing
+/// whitespace is also ignored. We also treat empty strings and strings containing only whitespace
+/// as invalid.
+int fish_wcstoi(const wchar_t *str, const wchar_t **endptr, int base) {
+    while (iswspace(*str)) ++str;  // skip leading whitespace
+    if (!*str) {  // this is because some implementations don't handle this sensibly
+        errno = EINVAL;
+        if (endptr) *endptr = str;
+        return 0;
+    }
+
+    errno = 0;
+    wchar_t *_endptr;
+    long result = wcstol(str, &_endptr, base);
+    if (result > INT_MAX) {
+        result = INT_MAX;
         errno = ERANGE;
-    } else if (ret < INT_MIN) {
-        ret = INT_MIN;
+    } else if (result < INT_MIN) {
+        result = INT_MIN;
         errno = ERANGE;
     }
-    return (int)ret;
+    while (iswspace(*_endptr)) ++_endptr;  // skip trailing whitespace
+    if (!errno && *_endptr) {
+        if (_endptr == str) {
+            errno = EINVAL;
+        } else {
+            errno = -1;
+        }
+    }
+    if (endptr) *endptr = _endptr;
+    return (int)result;
+}
+
+/// An enhanced version of wcstol().
+///
+/// This is needed because BSD and GNU implementations differ in several ways that make it really
+/// annoying to use them in a portable fashion.
+///
+/// The caller doesn't have to zero errno. Sets errno to -1 if the int ends with something other
+/// than a digit. Leading whitespace is ignored (per the base wcstol implementation). Trailing
+/// whitespace is also ignored.
+long fish_wcstol(const wchar_t *str, const wchar_t **endptr, int base) {
+    while (iswspace(*str)) ++str;  // skip leading whitespace
+    if (!*str) {  // this is because some implementations don't handle this sensibly
+        errno = EINVAL;
+        if (endptr) *endptr = str;
+        return 0;
+    }
+
+    errno = 0;
+    wchar_t *_endptr;
+    long result = wcstol(str, &_endptr, base);
+    while (iswspace(*_endptr)) ++_endptr;  // skip trailing whitespace
+    if (!errno && *_endptr) {
+        if (_endptr == str) {
+            errno = EINVAL;
+        } else {
+            errno = -1;
+        }
+    }
+    if (endptr) *endptr = _endptr;
+    return result;
+}
+
+/// An enhanced version of wcstoll().
+///
+/// This is needed because BSD and GNU implementations differ in several ways that make it really
+/// annoying to use them in a portable fashion.
+///
+/// The caller doesn't have to zero errno. Sets errno to -1 if the int ends with something other
+/// than a digit. Leading whitespace is ignored (per the base wcstoll implementation). Trailing
+/// whitespace is also ignored.
+long long fish_wcstoll(const wchar_t *str, const wchar_t **endptr, int base) {
+    while (iswspace(*str)) ++str;  // skip leading whitespace
+    if (!*str) {  // this is because some implementations don't handle this sensibly
+        errno = EINVAL;
+        if (endptr) *endptr = str;
+        return 0;
+    }
+
+    errno = 0;
+    wchar_t *_endptr;
+    long long result = wcstoll(str, &_endptr, base);
+    while (iswspace(*_endptr)) ++_endptr;  // skip trailing whitespace
+    if (!errno && *_endptr) {
+        if (_endptr == str) {
+            errno = EINVAL;
+        } else {
+            errno = -1;
+        }
+    }
+    if (endptr) *endptr = _endptr;
+    return result;
+}
+
+/// An enhanced version of wcstoull().
+///
+/// This is needed because BSD and GNU implementations differ in several ways that make it really
+/// annoying to use them in a portable fashion.
+///
+/// The caller doesn't have to zero errno. Sets errno to -1 if the int ends with something other
+/// than a digit. Leading minus is considered invalid. Leading whitespace is ignored (per the base
+/// wcstoull implementation). Trailing whitespace is also ignored.
+unsigned long long fish_wcstoull(const wchar_t *str, const wchar_t **endptr, int base) {
+    while (iswspace(*str)) ++str;  // skip leading whitespace
+    if (!*str ||      // this is because some implementations don't handle this sensibly
+        *str == '-')  // disallow minus as the first character to avoid questionable wrap-around
+    {
+        errno = EINVAL;
+        if (endptr) *endptr = str;
+        return 0;
+    }
+
+    errno = 0;
+    wchar_t *_endptr;
+    unsigned long long result = wcstoull(str, &_endptr, base);
+    while (iswspace(*_endptr)) ++_endptr;  // skip trailing whitespace
+    if (!errno && *_endptr) {
+        if (_endptr == str) {
+            errno = EINVAL;
+        } else {
+            errno = -1;
+        }
+    }
+    if (endptr) *endptr = _endptr;
+    return result;
 }
 
 file_id_t file_id_t::file_id_from_stat(const struct stat *buf) {
@@ -464,7 +662,7 @@ file_id_t file_id_t::file_id_from_stat(const struct stat *buf) {
     result.change_seconds = buf->st_ctime;
     result.mod_seconds = buf->st_mtime;
 
-#if STAT_HAVE_NSEC
+#ifdef HAVE_STRUCT_STAT_ST_CTIME_NSEC
     result.change_nanoseconds = buf->st_ctime_nsec;
     result.mod_nanoseconds = buf->st_mtime_nsec;
 #elif defined(__APPLE__)
@@ -484,7 +682,7 @@ file_id_t file_id_t::file_id_from_stat(const struct stat *buf) {
 file_id_t file_id_for_fd(int fd) {
     file_id_t result = kInvalidFileID;
     struct stat buf = {};
-    if (0 == fstat(fd, &buf)) {
+    if (fd >= 0 && 0 == fstat(fd, &buf)) {
         result = file_id_t::file_id_from_stat(&buf);
     }
     return result;

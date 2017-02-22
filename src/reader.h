@@ -5,6 +5,7 @@
 #define FISH_READER_H
 
 #include <stddef.h>
+
 #include <string>
 #include <vector>
 
@@ -192,10 +193,10 @@ void reader_set_exit_on_interrupt(bool flag);
 bool shell_is_exiting();
 
 /// The readers interrupt signal handler. Cancels all currently running blocks.
-void reader_handle_int(int signal);
+void reader_handle_sigint();
 
 /// This function returns true if fish is exiting by force, i.e. because stdin died.
-int reader_exit_forced();
+bool reader_exit_forced();
 
 /// Test if the given shell command contains errors. Uses parser_test for testing. Suitable for
 /// reader_set_test_function().

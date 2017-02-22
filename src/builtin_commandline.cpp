@@ -1,12 +1,10 @@
 // Functions used for implementing the commandline builtin.
 #include "config.h"  // IWYU pragma: keep
 
-#include <assert.h>
 #include <errno.h>
-#include <pthread.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <wchar.h>
-#include <cstring>
 
 #include "builtin.h"
 #include "common.h"
@@ -50,46 +48,37 @@ static const wchar_t *get_buffer() { return current_buffer; }
 /// Returns the position of the cursor.
 static size_t get_cursor_pos() { return current_cursor_pos; }
 
-static pthread_mutex_t transient_commandline_lock = PTHREAD_MUTEX_INITIALIZER;
-static wcstring_list_t *get_transient_stack() {
+static owning_lock<wcstring_list_t> &get_transient_stack() {
     ASSERT_IS_MAIN_THREAD();
-    ASSERT_IS_LOCKED(transient_commandline_lock);
-    // A pointer is a little more efficient than an object as a static because we can elide the
-    // thread-safe initialization.
-    static wcstring_list_t *result = NULL;
-    if (!result) {
-        result = new wcstring_list_t();
-    }
-    return result;
+    static owning_lock<wcstring_list_t> s_transient_stack;
+    return s_transient_stack;
 }
 
 static bool get_top_transient(wcstring *out_result) {
-    ASSERT_IS_MAIN_THREAD();
-    bool result = false;
-    scoped_lock locker(transient_commandline_lock);
-    const wcstring_list_t *stack = get_transient_stack();
-    if (!stack->empty()) {
-        out_result->assign(stack->back());
-        result = true;
+    auto locked = get_transient_stack().acquire();
+    wcstring_list_t &stack = locked.value;
+    if (stack.empty()) {
+        return false;
     }
-    return result;
+    out_result->assign(stack.back());
+    return true;
 }
 
 builtin_commandline_scoped_transient_t::builtin_commandline_scoped_transient_t(
     const wcstring &cmd) {
     ASSERT_IS_MAIN_THREAD();
-    scoped_lock locker(transient_commandline_lock);
-    wcstring_list_t *stack = get_transient_stack();
-    stack->push_back(cmd);
-    this->token = stack->size();
+    auto locked = get_transient_stack().acquire();
+    wcstring_list_t &stack = locked.value;
+    stack.push_back(cmd);
+    this->token = stack.size();
 }
 
 builtin_commandline_scoped_transient_t::~builtin_commandline_scoped_transient_t() {
     ASSERT_IS_MAIN_THREAD();
-    scoped_lock locker(transient_commandline_lock);
-    wcstring_list_t *stack = get_transient_stack();
-    assert(this->token == stack->size());
-    stack->pop_back();
+    auto locked = get_transient_stack().acquire();
+    wcstring_list_t &stack = locked.value;
+    assert(this->token == stack.size());
+    stack.pop_back();
 }
 
 /// Replace/append/insert the selection with/at/after the specified string.
@@ -127,6 +116,10 @@ static void replace_part(const wchar_t *begin, const wchar_t *end, const wchar_t
             out_pos += wcslen(insert);
             break;
         }
+        default: {
+            DIE("unexpected append_mode");
+            break;
+        }
     }
     out.append(end);
     reader_set_buffer(out, out_pos);
@@ -152,29 +145,23 @@ static void write_part(const wchar_t *begin, const wchar_t *end, int cut_at_curs
         while (tok.next(&token)) {
             if ((cut_at_cursor) && (token.offset + token.text.size() >= pos)) break;
 
-            switch (token.type) {
-                case TOK_STRING: {
-                    wcstring tmp = token.text;
-                    unescape_string_in_place(&tmp, UNESCAPE_INCOMPLETE);
-                    out.append(tmp);
-                    out.push_back(L'\n');
-                    break;
-                }
-                default: { break; }
+            if (token.type == TOK_STRING) {
+                wcstring tmp = token.text;
+                unescape_string_in_place(&tmp, UNESCAPE_INCOMPLETE);
+                out.append(tmp);
+                out.push_back(L'\n');
             }
         }
 
         streams.out.append(out);
-
         free(buff);
     } else {
         if (cut_at_cursor) {
-            end = begin + pos;
+            streams.out.append(begin, pos);
+        } else {
+            streams.out.append(begin, end - begin);
         }
-
-        // debug( 0, L"woot2 %ls -> %ls", buff, esc );
-        streams.out.append(begin, end - begin);
-        streams.out.append(L"\n");
+        streams.out.push_back(L'\n');
     }
 }
 
@@ -332,6 +319,10 @@ int builtin_commandline(parser_t &parser, io_streams_t &streams, wchar_t **argv)
                 builtin_unknown_option(parser, streams, argv[0], argv[w.woptind - 1]);
                 return 1;
             }
+            default: {
+                DIE("unexpected opt");
+                break;
+            }
         }
     }
 
@@ -361,7 +352,7 @@ int builtin_commandline(parser_t &parser, io_streams_t &streams, wchar_t **argv)
                 // the queue of unused keypresses.
                 input_queue_ch(c);
             } else {
-                streams.err.append_format(_(L"%ls: Unknown input function '%ls'\n"), argv[0],
+                streams.err.append_format(_(L"%ls: Unknown input function '%ls'"), argv[0],
                                           argv[i]);
                 builtin_print_help(parser, streams, argv[0], streams.err);
                 return 1;
@@ -382,7 +373,7 @@ int builtin_commandline(parser_t &parser, io_streams_t &streams, wchar_t **argv)
 
     // Check for invalid switch combinations.
     if ((search_mode || line_mode || cursor_mode || paging_mode) && (argc - w.woptind > 1)) {
-        streams.err.append_format(argv[0], L": Too many arguments\n", NULL);
+        streams.err.append_format(L"%ls: Too many arguments", argv[0]);
         builtin_print_help(parser, streams, argv[0], streams.err);
         return 1;
     }
@@ -424,12 +415,8 @@ int builtin_commandline(parser_t &parser, io_streams_t &streams, wchar_t **argv)
 
     if (cursor_mode) {
         if (argc - w.woptind) {
-            wchar_t *endptr;
-            long new_pos;
-            errno = 0;
-
-            new_pos = wcstol(argv[w.woptind], &endptr, 10);
-            if (*endptr || errno) {
+            long new_pos = fish_wcstol(argv[w.woptind]);
+            if (errno) {
                 streams.err.append_format(BUILTIN_ERR_NOT_NUMBER, argv[0], argv[w.woptind]);
                 builtin_print_help(parser, streams, argv[0], streams.err);
             }
@@ -476,26 +463,24 @@ int builtin_commandline(parser_t &parser, io_streams_t &streams, wchar_t **argv)
             parse_util_token_extent(get_buffer(), get_cursor_pos(), &begin, &end, 0, 0);
             break;
         }
+        default: {
+            DIE("unexpected buffer_part");
+            break;
+        }
     }
 
-    switch (argc - w.woptind) {
-        case 0: {
-            write_part(begin, end, cut_at_cursor, tokenize, streams);
-            break;
+    int arg_count = argc - w.woptind;
+    if (arg_count == 0) {
+        write_part(begin, end, cut_at_cursor, tokenize, streams);
+    } else if (arg_count == 1) {
+        replace_part(begin, end, argv[w.woptind], append_mode);
+    } else {
+        wcstring sb = argv[w.woptind];
+        for (int i = w.woptind + 1; i < argc; i++) {
+            sb.push_back(L'\n');
+            sb.append(argv[i]);
         }
-        case 1: {
-            replace_part(begin, end, argv[w.woptind], append_mode);
-            break;
-        }
-        default: {
-            wcstring sb = argv[w.woptind];
-            for (int i = w.woptind + 1; i < argc; i++) {
-                sb.push_back(L'\n');
-                sb.append(argv[i]);
-            }
-            replace_part(begin, end, sb.c_str(), append_mode);
-            break;
-        }
+        replace_part(begin, end, sb.c_str(), append_mode);
     }
 
     return 0;

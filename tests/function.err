@@ -1,8 +1,9 @@
-function: function name shadows a builtin so you must use '--shadow-builtin'
-fish: function pwd; end
+function: Illegal function name '-a'
+fish: function -a arg1 arg2 name2 ; end
       ^
-yes, it failed as expected
-function: function name does not shadow a builtin so you must not use '--shadow-builtin'
-fish: function not_builtin --shadow-builtin; end
+function: Illegal function name '--argument-names'
+fish: function --argument-names arg1 arg2 name4 ; end
       ^
-yes, it failed as expected
+function: Unexpected positional argument 'abc'
+fish: function name5 abc --argument-names def ; end
+      ^

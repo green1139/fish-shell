@@ -4,6 +4,10 @@
 # should be running it via `make test` to ensure the environment is properly
 # setup.
 
+# Set this var to modify behavior of the code being tests. Such as avoiding running
+# `fish_update_completions` when running tests.
+set -x FISH_UNIT_TESTS_RUNNING 1
+
 # Change to directory containing this script
 cd (dirname (status -f))
 
@@ -13,6 +17,12 @@ if set -q argv[1]
 else
     set files_to_test *.in
 end
+
+# These env vars should not be inherited from the user environment because they can affect the
+# behavior of the tests. So either remove them or set them to a known value.
+# See also tests/interactive.fish.
+set TERM xterm
+set -e ITERM_PROFILE
 
 source test_util.fish (status -f) $argv; or exit
 

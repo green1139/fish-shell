@@ -17,22 +17,20 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 */
 #include "config.h"
 
-#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
 #include <locale.h>
-#include <pwd.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>  // IWYU pragma: keep
 #include <sys/stat.h>
-#include <sys/un.h>
 #include <unistd.h>
 #include <wchar.h>
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -47,13 +45,12 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include "function.h"
 #include "history.h"
 #include "input.h"
-#include "input_common.h"
 #include "io.h"
 #include "parser.h"
 #include "path.h"
 #include "proc.h"
 #include "reader.h"
-#include "wildcard.h"
+#include "signal.h"
 #include "wutil.h"  // IWYU pragma: keep
 
 // PATH_MAX may not exist.
@@ -91,6 +88,8 @@ static std::string get_executable_path(const char *argv0) {
 
 #if __APPLE__
     // On OS X use it's proprietary API to get the path to the executable.
+    // This is basically grabbing exec_path after argc, argv, envp, ...: for us
+    // https://opensource.apple.com/source/adv_cmds/adv_cmds-163/ps/print.c
     uint32_t buffSize = sizeof buff;
     if (_NSGetExecutablePath(buff, &buffSize) == 0) return std::string(buff);
 #else
@@ -120,49 +119,30 @@ static struct config_paths_t determine_config_directory_paths(const char *argv0)
     bool done = false;
     std::string exec_path = get_executable_path(argv0);
     if (get_realpath(exec_path)) {
-#if __APPLE__
-
-        // On OS X, maybe we're an app bundle, and should use the bundle's files. Since we don't
-        // link CF, use this lame approach to test it: see if the resolved path ends with
-        // /Contents/MacOS/fish, case insensitive since HFS+ usually is.
+        debug(2, L"exec_path: '%s'", exec_path.c_str());
         if (!done) {
-            const char *suffix = "Contents/Resources/base/bin/fish";
-            const size_t suffixlen = strlen(suffix);
-            if (has_suffix(exec_path, suffix, true)) {
-                // Looks like we're a bundle. Cut the string at the / prefixing /Contents... and
-                // then the rest.
-                wcstring wide_resolved_path = str2wcstring(exec_path);
-                wide_resolved_path.resize(exec_path.size() - suffixlen);
-                wide_resolved_path.append(L"Contents/Resources/base/");
+            // The next check is that we are in a reloctable directory tree
+            const char *installed_suffix = "/bin/fish";
+            const char *just_a_fish = "/fish";
+            const char *suffix = NULL;
 
-                // Append share, etc, doc.
-                paths.data = wide_resolved_path + L"share/fish";
-                paths.sysconf = wide_resolved_path + L"etc/fish";
-                paths.doc = wide_resolved_path + L"doc/fish";
-
-                // But the bin_dir is the resolved_path, minus fish (aka the MacOS directory).
-                paths.bin = str2wcstring(exec_path);
-                paths.bin.resize(paths.bin.size() - strlen("/fish"));
-
-                done = true;
+            if (has_suffix(exec_path, installed_suffix, false)) {
+                suffix = installed_suffix;
+            } else if (has_suffix(exec_path, just_a_fish, false)) {
+                debug(2, L"'fish' not in a 'bin/', trying paths relative to source tree");
+                suffix = just_a_fish;
             }
-        }
-#endif
 
-        if (!done) {
-            // The next check is that we are in a reloctable directory tree like this:
-            //   bin/fish
-            //   etc/fish
-            //   share/fish
-            const char *suffix = "/bin/fish";
-            if (has_suffix(exec_path, suffix, false)) {
+            if (suffix) {
+                bool seems_installed = (suffix == installed_suffix);
+
                 wcstring base_path = str2wcstring(exec_path);
                 base_path.resize(base_path.size() - strlen(suffix));
 
-                paths.data = base_path + L"/share/fish";
-                paths.sysconf = base_path + L"/etc/fish";
-                paths.doc = base_path + L"/share/doc/fish";
-                paths.bin = base_path + L"/bin";
+                paths.data = base_path + (seems_installed ? L"/share/fish" : L"/share");
+                paths.sysconf = base_path + (seems_installed ? L"/etc/fish" : L"/etc");
+                paths.doc = base_path + (seems_installed ? L"/share/doc/fish" : L"/user_doc/html");
+                paths.bin = base_path + (seems_installed ? L"/bin" : L"");
 
                 // Check only that the data and sysconf directories exist. Handle the doc
                 // directories separately.
@@ -180,12 +160,17 @@ static struct config_paths_t determine_config_directory_paths(const char *argv0)
 
     if (!done) {
         // Fall back to what got compiled in.
+        debug(2, L"Using compiled in paths:");
         paths.data = L"" DATADIR "/fish";
         paths.sysconf = L"" SYSCONFDIR "/fish";
         paths.doc = L"" DOCDIR;
         paths.bin = L"" BINDIR;
     }
 
+    debug(2,
+          L"determine_config_directory_paths() results:\npaths.data: %ls\npaths.sysconf: "
+          L"%ls\npaths.doc: %ls\npaths.bin: %ls",
+          paths.data.c_str(), paths.sysconf.c_str(), paths.doc.c_str(), paths.bin.c_str());
     return paths;
 }
 
@@ -212,82 +197,6 @@ static void source_config_in_directory(const wcstring &dir) {
     parser.set_is_within_fish_initialization(true);
     parser.eval(cmd, io_chain_t(), TOP);
     parser.set_is_within_fish_initialization(false);
-}
-
-static int try_connect_socket(std::string &name) {
-    int s, r, ret = -1;
-
-    /// Connect to a DGRAM socket rather than the expected STREAM. This avoids any notification to a
-    /// remote socket that we have connected, preventing any surprising behaviour. If the connection
-    /// fails with EPROTOTYPE, the connection is probably a STREAM; if it succeeds or fails any
-    /// other way, there is no cause for alarm. With thanks to Andrew Lutomirski <github.com/amluto>
-    if ((s = socket(AF_UNIX, SOCK_DGRAM, 0)) == -1) {
-        wperror(L"socket");
-        return -1;
-    }
-
-    debug(3, L"Connect to socket %s at fd %d", name.c_str(), s);
-
-    struct sockaddr_un local = {};
-    local.sun_family = AF_UNIX;
-    strncpy(local.sun_path, name.c_str(), (sizeof local.sun_path) - 1);
-
-    r = connect(s, (struct sockaddr *)&local, sizeof local);
-
-    if (r == -1 && errno == EPROTOTYPE) {
-        ret = 0;
-    }
-
-    close(s);
-    return ret;
-}
-
-/// Check for a running fishd from old versions and warn about not being able to share variables.
-/// https://github.com/fish-shell/fish-shell/issues/1730
-static void check_running_fishd() {
-    // There are two paths to check:
-    // $FISHD_SOCKET_DIR/fishd.socket.$USER or /tmp/fishd.socket.$USER
-    //   - referred to as the "old socket"
-    // $XDG_RUNTIME_DIR/fishd.socket or /tmp/fish.$USER/fishd.socket
-    //   - referred to as the "new socket"
-    // All existing versions of fish attempt to create the old socket, but
-    // failure in newer versions is not treated as critical, so both need
-    // to be checked.
-    const char *uname = getenv("USER");
-    if (uname == NULL) {
-        const struct passwd *pw = getpwuid(getuid());
-        uname = pw->pw_name;
-    }
-
-    const char *dir_old_socket = getenv("FISHD_SOCKET_DIR");
-    std::string path_old_socket;
-
-    if (dir_old_socket == NULL) {
-        path_old_socket = "/tmp/";
-    } else {
-        path_old_socket.append(dir_old_socket);
-    }
-
-    path_old_socket.append("fishd.socket.");
-    path_old_socket.append(uname);
-
-    const char *dir_new_socket = getenv("XDG_RUNTIME_DIR");
-    std::string path_new_socket;
-    if (dir_new_socket == NULL) {
-        path_new_socket = "/tmp/fish.";
-        path_new_socket.append(uname);
-        path_new_socket.push_back('/');
-    } else {
-        path_new_socket.append(dir_new_socket);
-    }
-
-    path_new_socket.append("fishd.socket");
-
-    if (try_connect_socket(path_old_socket) == 0 || try_connect_socket(path_new_socket) == 0) {
-        debug(1, _(L"Old versions of fish appear to be running. You will not be able to share "
-                   L"variable values between old and new fish sessions. For best results, restart "
-                   L"all running instances of fish."));
-    }
 }
 
 /// Parse init files. exec_path is the path of fish executable as determined by argv[0].
@@ -326,6 +235,7 @@ static int fish_parse_opt(int argc, char **argv, std::vector<std::string> *cmds)
             case 0: {
                 fwprintf(stderr, _(L"getopt_long() unexpectedly returned zero\n"));
                 exit(127);
+                break;
             }
             case 'c': {
                 cmds->push_back(optarg);
@@ -370,6 +280,7 @@ static int fish_parse_opt(int argc, char **argv, std::vector<std::string> *cmds)
             case 'v': {
                 fwprintf(stdout, _(L"%s, version %s\n"), PACKAGE_NAME, get_fish_version());
                 exit(0);
+                break;
             }
             case 'D': {
                 char *end;
@@ -389,6 +300,7 @@ static int fish_parse_opt(int argc, char **argv, std::vector<std::string> *cmds)
             default: {
                 // We assume getopt_long() has already emitted a diagnostic msg.
                 exit(1);
+                break;
             }
         }
     }
@@ -409,6 +321,16 @@ static int fish_parse_opt(int argc, char **argv, std::vector<std::string> *cmds)
 /// Various things we need to initialize at run-time that don't really fit any of the other init
 /// routines.
 static void misc_init() {
+    env_set_read_limit();
+
+    // If stdout is open on a tty ensure stdio is unbuffered. That's because those functions might
+    // be intermixed with `write()` calls and we need to ensure the writes are not reordered. See
+    // issue #3748.
+    if (isatty(STDOUT_FILENO)) {
+        fflush(stdout);
+        setvbuf(stdout, NULL, _IONBF, 0);
+    }
+
 #ifdef OS_IS_CYGWIN
     // MS Windows tty devices do not currently have either a read or write timestamp. Those
     // respective fields of `struct stat` are always the current time. Which means we can't
@@ -436,11 +358,6 @@ int main(int argc, char **argv) {
     int res = 1;
     int my_optind = 0;
 
-    // We can't do this at compile time due to the use of enum symbols.
-    assert(EXPAND_SENTINAL >= EXPAND_RESERVED_BASE && EXPAND_SENTINAL <= EXPAND_RESERVED_END);
-    assert(ANY_SENTINAL >= WILDCARD_RESERVED_BASE && ANY_SENTINAL <= WILDCARD_RESERVED_END);
-    assert(R_SENTINAL >= INPUT_COMMON_BASE && R_SENTINAL <= INPUT_COMMON_END);
-
     program_name = L"fish";
     set_main_thread();
     setup_fork_guards();
@@ -451,6 +368,11 @@ int main(int argc, char **argv) {
     // struct stat tmp;
     // stat("----------FISH_HIT_MAIN----------", &tmp);
 
+    if (!argv[0]) {
+        static const char *dummy_argv[2] = {"fish", NULL};
+        argv = (char **)dummy_argv;  //!OCLINT(parameter reassignment)
+        argc = 1;                    //!OCLINT(parameter reassignment)
+    }
     std::vector<std::string> cmds;
     my_optind = fish_parse_opt(argc, argv, &cmds);
 
@@ -483,6 +405,11 @@ int main(int argc, char **argv) {
 
     const io_chain_t empty_ios;
     if (read_init(paths)) {
+        // TODO: Remove this once we're confident that not blocking/unblocking every signal around
+        // some critical sections is no longer necessary.
+        env_var_t fish_no_signal_block = env_get_string(L"FISH_NO_SIGNAL_BLOCK");
+        if (!fish_no_signal_block.missing()) ignore_signal_block = true;
+
         // Stomp the exit status of any initialization commands (issue #635).
         proc_set_last_status(STATUS_BUILTIN_OK);
 
@@ -499,7 +426,6 @@ int main(int argc, char **argv) {
             reader_exit(0, 0);
         } else if (my_optind == argc) {
             // Interactive mode
-            check_running_fishd();
             res = reader_read(STDIN_FILENO, empty_ios);
         } else {
             char *file = *(argv + (my_optind++));
@@ -529,9 +455,9 @@ int main(int argc, char **argv) {
                 res = reader_read(fd, empty_ios);
 
                 if (res) {
-                    debug(1, _(L"Error while reading file %ls\n"), reader_current_filename()
-                                                                       ? reader_current_filename()
-                                                                       : _(L"Standard input"));
+                    debug(1, _(L"Error while reading file %ls\n"),
+                          reader_current_filename() ? reader_current_filename()
+                                                    : _(L"Standard input"));
                 }
                 reader_pop_current_filename();
             }

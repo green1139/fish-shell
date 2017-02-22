@@ -1,21 +1,21 @@
-[fish](http://fishshell.com/) - the friendly interactive shell [![Build Status](https://travis-ci.org/fish-shell/fish-shell.svg?branch=master)](https://travis-ci.org/fish-shell/fish-shell)
+[fish](https://fishshell.com/) - the friendly interactive shell [![Build Status](https://travis-ci.org/fish-shell/fish-shell.svg?branch=master)](https://travis-ci.org/fish-shell/fish-shell)
 ================================================
 
 fish is a smart and user-friendly command line shell for OS X, Linux, and the rest of the family. fish includes features like syntax highlighting, autosuggest-as-you-type, and fancy tab completions that just work, with no configuration required.
 
-For more on fish's design philosophy, see the [design document](http://fishshell.com/docs/current/design.html).
+For more on fish's design philosophy, see the [design document](https://fishshell.com/docs/current/design.html).
 
 ## Quick Start
 
-fish generally works like other shells, like bash or zsh. A few important differences can be found at <http://fishshell.com/docs/current/tutorial.html> by searching for the magic phrase "unlike other shells".
+fish generally works like other shells, like bash or zsh. A few important differences can be found at <https://fishshell.com/docs/current/tutorial.html> by searching for the magic phrase "unlike other shells".
 
-Detailed user documentation is available by running `help` within fish, and also at <http://fishshell.com/docs/current/index.html>
+Detailed user documentation is available by running `help` within fish, and also at <https://fishshell.com/docs/current/index.html>
 
 ## Building
 
-Fish can be built using a C++11 environment but only requires C++03. It builds successfully with g++ 4.2 or later, and with clang. This allows fish to run on older systems such as OS X Snow Leopard (released in 2009).
+fish requires a C++11 compiler. It builds successfully with g++ 4.8 or later, or with clang 3.3 or later.
 
-Fish can be built using autotools or Xcode. autoconf 2.60 or later is required to build from git versions, but is not required for releases.
+fish can be built using autotools or Xcode. autoconf 2.60 or later, as well as automake 1.13 or later, are required to build from git versions. These are not required to build from released tarballs.
 
 fish depends on a curses implementation, such as ncurses. The headers and libraries are required for building.
 
@@ -27,7 +27,7 @@ Building the documentation requires Doxygen 1.8.7 or newer.
 
 ### Autotools Build
 
-    autoconf [if building from Git]
+    autoreconf --no-recursive [if building from Git]
     ./configure
     make [gmake on BSD]
     sudo make install
@@ -64,9 +64,11 @@ fish requires a number of utilities to operate, which should be present on any U
 
 Translation support requires the gettext program.
 
+Usage output for builtin functions is generated on-demand from the installed manpages using `nroff` and `ul`.
+
 Some optional features of fish, such as the manual page completion parser and the web configuration tool, require Python.
 
-In order to generate completions from man pages compressed with either lzma or xz, you may need to install an extra Python package. Python versions prior to 2.6 are not supported.  For Python versions 2.6 to 3.2 you need to install the module `backports.lzma`.  How to install it depends on your system and how you installed Python.  Most Linux distributions should include it as a package named `backports-lzma` (or similar).  From version 3.3 onwards, Python already includes the required module.
+In order to generate completions from man pages compressed with either lzma or xz, you may need to install an extra Python package. Python versions prior to 2.6 are not supported.  To process lzma-compresed manpages, backports.lzma is needed for Python 3.2 or older. From version 3.3 onwards, Python already includes the required module.
 
 ## Packages for Linux
 

@@ -80,18 +80,6 @@ expect_prompt -re {\r\nsuccess: default escape timeout\r\n} {
     puts stderr "vi replace line, default timeout: long delay"
 }
 
-# Verify that a human can transpose words using \et (which is an emacs default
-# binding but should be valid while in vi insert or normal mode).
-send "echo abc def"
-send "\033"
-sleep 0.010
-send "t\r"
-expect_prompt -re {\r\ndef abc\r\n} {
-    puts "vi transpose words, default timeout: short delay"
-} unmatched {
-    puts stderr "vi transpose words, default timeout: short delay"
-}
-
 # Test replacing a single character.
 send "echo TEXT"
 send "\033"
@@ -102,6 +90,18 @@ expect_prompt -re {\r\nTAXT\r\n} {
     puts "vi mode replace char, default timeout: long delay"
 } unmatched {
     puts stderr "vi mode replace char, default timeout: long delay"
+}
+
+# Test deleting characters with 'x'.
+send "echo MORE-TEXT"
+send "\033"
+# Delay needed to allow fish to transition to vi "normal" mode.
+sleep 0.150
+send "xxxxx\r"
+expect_prompt -re {\r\nMORE\r\n} {
+    puts "vi mode delete char, default timeout: long delay"
+} unmatched {
+    puts stderr "vi mode delete char, default timeout: long delay"
 }
 
 # Verify that changing the escape timeout has an effect.

@@ -2,8 +2,12 @@
 #include "config.h"
 
 #include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <termios.h>
 #include <unistd.h>
 #include <wchar.h>
+#include <wctype.h>
 #if HAVE_NCURSES_H
 #include <ncurses.h>
 #elif HAVE_NCURSES_CURSES_H
@@ -16,8 +20,7 @@
 #elif HAVE_NCURSES_TERM_H
 #include <ncurses/term.h>
 #endif
-#include <stdlib.h>
-#include <wctype.h>
+
 #include <algorithm>
 #include <memory>
 #include <string>
@@ -53,11 +56,11 @@ struct input_mapping_t {
     /// New mode that should be switched to after command evaluation.
     wcstring sets_mode;
 
-    input_mapping_t(const wcstring &s, const std::vector<wcstring> &c,
-                    const wcstring &m = DEFAULT_BIND_MODE, const wcstring &sm = DEFAULT_BIND_MODE)
+    input_mapping_t(const wcstring &s, const std::vector<wcstring> &c, const wcstring &m,
+                    const wcstring &sm)
         : seq(s), commands(c), mode(m), sets_mode(sm) {
-        static unsigned int s_last_input_mapping_specification_order = 0;
-        specification_order = ++s_last_input_mapping_specification_order;
+        static unsigned int s_last_input_map_spec_order = 0;
+        specification_order = ++s_last_input_map_spec_order;
     }
 };
 
@@ -124,7 +127,7 @@ static const wchar_t *const name_arr[] = {L"beginning-of-line",
 
 wcstring describe_char(wint_t c) {
     wint_t initial_cmd_char = R_BEGINNING_OF_LINE;
-    size_t name_count = sizeof name_arr / sizeof *name_arr;
+    long name_count = sizeof(name_arr) / sizeof(*name_arr);
     if (c >= initial_cmd_char && c < initial_cmd_char + name_count) {
         return format_string(L"%02x (%ls)", c, name_arr[c - initial_cmd_char]);
     }
@@ -216,18 +219,17 @@ wcstring input_get_bind_mode() {
 
 /// Set the current bind mode.
 void input_set_bind_mode(const wcstring &bm) {
-    env_set(FISH_BIND_MODE_VAR, bm.c_str(), ENV_GLOBAL);
+    // Only set this if it differs to not execute variable handlers all the time.
+    // modes may not be empty - empty is a sentinel value meaning to not change the mode
+    assert(!bm.empty());
+    if (input_get_bind_mode() != bm.c_str()) {
+        env_set(FISH_BIND_MODE_VAR, bm.c_str(), ENV_GLOBAL);
+    }
 }
 
 /// Returns the arity of a given input function.
-int input_function_arity(int function) {
-    switch (function) {
-        case R_FORWARD_JUMP:
-        case R_BACKWARD_JUMP: {
-            return 1;
-        }
-        default: { return 0; }
-    }
+static int input_function_arity(int function) {
+    return (function == R_FORWARD_JUMP || function == R_BACKWARD_JUMP) ? 1 : 0;
 }
 
 /// Sets the return status of the most recently executed input function.
@@ -292,8 +294,7 @@ static int interrupt_handler() {
     if (job_reap(1)) reader_repaint_needed();
     // Tell the reader an event occured.
     if (reader_reading_interrupted()) {
-        // Return 3, i.e. the character read by a Control-C.
-        return 3;
+        return shell_modes.c_cc[VINTR];
     }
 
     return R_NULL;
@@ -375,7 +376,7 @@ int input_init() {
         } else {
             debug(0, _(L"Using fallback terminal type '%ls'"), DEFAULT_TERM);
         }
-    } else {
+        fputwc(L'\n', stderr);
     }
 
     input_terminfo_init();
@@ -419,7 +420,7 @@ void input_function_push_args(int code) {
         wchar_t arg;
 
         // Skip and queue up any function codes. See issue #2357.
-        while (((arg = input_common_readch(0)) >= R_MIN) && (arg <= R_MAX)) {
+        while ((arg = input_common_readch(0)) >= R_MIN && arg <= R_MAX) {
             skipped.push_back(arg);
         }
 
@@ -450,7 +451,7 @@ static void input_mapping_execute(const input_mapping_t &m, bool allow_commands)
 
     // !has_functions && !has_commands: only set bind mode
     if (!has_commands && !has_functions) {
-        input_set_bind_mode(m.sets_mode);
+        if (!m.sets_mode.empty()) input_set_bind_mode(m.sets_mode);
         return;
     }
 
@@ -489,15 +490,16 @@ static void input_mapping_execute(const input_mapping_t &m, bool allow_commands)
         input_common_next_ch(R_NULL);
     }
 
-    input_set_bind_mode(m.sets_mode);
+    // Empty bind mode indicates to not reset the mode (#2871)
+    if (!m.sets_mode.empty()) input_set_bind_mode(m.sets_mode);
 }
 
 /// Try reading the specified function mapping.
 static bool input_mapping_is_match(const input_mapping_t &m) {
-    wint_t c = 0;
+    wchar_t c = 0;
     int j;
 
-    // debug(0, L"trying mapping %ls\n", escape(m.seq.c_str(), ESCAPE_ALL).c_str());
+    debug(2, L"trying to match mapping %ls", escape(m.seq.c_str(), ESCAPE_ALL).c_str());
     const wchar_t *str = m.seq.c_str();
     for (j = 0; str[j] != L'\0'; j++) {
         bool timed = (j > 0 && iswcntrl(str[0]));
@@ -515,7 +517,8 @@ static bool input_mapping_is_match(const input_mapping_t &m) {
         return true;
     }
 
-    // Return the read characters.
+    // Reinsert the chars we read to be read again since we didn't match the bind sequence (i.e.,
+    // the input mapping).
     input_common_next_ch(c);
     for (int k = j - 1; k >= 0; k--) {
         input_common_next_ch(m.seq[k]);
@@ -531,7 +534,7 @@ static void input_mapping_execute_matching_or_generic(bool allow_commands) {
 
     const wcstring bind_mode = input_get_bind_mode();
 
-    for (int i = 0; i < mapping_list.size(); i++) {
+    for (size_t i = 0; i < mapping_list.size(); i++) {
         const input_mapping_t &m = mapping_list.at(i);
 
         // debug(0, L"trying mapping (%ls,%ls,%ls)\n", escape(m.seq.c_str(), ESCAPE_ALL).c_str(),
@@ -554,9 +557,11 @@ static void input_mapping_execute_matching_or_generic(bool allow_commands) {
     if (generic) {
         input_mapping_execute(*generic, allow_commands);
     } else {
-        // debug(0, L"no generic found, ignoring...");
+        debug(2, L"no generic found, ignoring char...");
         wchar_t c = input_common_readch(0);
-        if (c == R_EOF) input_common_next_ch(c);
+        if (c == R_EOF) {
+            input_common_next_ch(c);
+        }
     }
 }
 
@@ -608,8 +613,9 @@ wint_t input_readch(bool allow_commands) {
                     if (input_function_status) {
                         return input_readch();
                     }
-                    while ((c = input_common_readch(0)) && c >= R_MIN && c <= R_MAX) {
-                        // do nothing
+                    c = input_common_readch(0);
+                    while (c >= R_MIN && c <= R_MAX) {
+                        c = input_common_readch(0);
                     }
                     input_common_next_ch(c);
                     return input_readch();

@@ -2,10 +2,14 @@
 #include "config.h"  // IWYU pragma: keep
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <wchar.h>
 #include <wctype.h>
+
 #include <algorithm>
 #include <iterator>
 #include <memory>
@@ -26,7 +30,7 @@
 class parser_t;
 
 // Error message for invalid path operations.
-#define BUILTIN_SET_PATH_ERROR L"%ls: Warning: path component %ls may not be valid in %ls.\n"
+#define BUILTIN_SET_PATH_ERROR L"%ls: Warning: $%ls entry \"%ls\" is not valid (%s)\n"
 
 // Hint for invalid path operation with a colon.
 #define BUILTIN_SET_PATH_HINT L"%ls: Did you mean 'set %ls $%ls %ls'?\n"
@@ -72,33 +76,28 @@ static int my_env_set(const wchar_t *key, const wcstring_list_t &val, int scope,
                 continue;
             }
 
-            bool show_perror = false;
             int show_hint = 0;
             bool error = false;
-
             struct stat buff;
-            if (wstat(dir, &buff)) {
+            if (wstat(dir, &buff) == -1) {
                 error = true;
-                show_perror = true;
-            }
-
-            if (!(S_ISDIR(buff.st_mode))) {
+            } else if (!S_ISDIR(buff.st_mode)) {
+                error = true;
+                errno = ENOTDIR;
+            } else if (waccess(dir, X_OK) == -1) {
                 error = true;
             }
 
             if (!error) {
                 any_success = true;
             } else {
-                streams.err.append_format(_(BUILTIN_SET_PATH_ERROR), L"set", dir.c_str(), key);
+                streams.err.append_format(_(BUILTIN_SET_PATH_ERROR), L"set", key, dir.c_str(),
+                                          strerror(errno));
                 const wchar_t *colon = wcschr(dir.c_str(), L':');
 
                 if (colon && *(colon + 1)) {
                     show_hint = 1;
                 }
-            }
-
-            if (show_perror) {
-                builtin_wperror(L"set", streams);
             }
 
             if (show_hint) {
@@ -126,6 +125,9 @@ static int my_env_set(const wchar_t *key, const wcstring_list_t &val, int scope,
     }
 
     switch (env_set(key, val_str, scope | ENV_USER)) {
+        case ENV_OK: {
+            break;
+        }
         case ENV_PERM: {
             streams.err.append_format(_(L"%ls: Tried to change the read-only variable '%ls'\n"),
                                       L"set", key);
@@ -146,6 +148,10 @@ static int my_env_set(const wchar_t *key, const wcstring_list_t &val, int scope,
             retcode = 1;
             break;
         }
+        default: {
+            DIE("unexpected env_set() ret val");
+            break;
+        }
     }
 
     return retcode;
@@ -162,7 +168,6 @@ static int my_env_set(const wchar_t *key, const wcstring_list_t &val, int scope,
 static int parse_index(std::vector<long> &indexes, const wchar_t *src, const wchar_t *name,
                        size_t var_count, io_streams_t &streams) {
     size_t len;
-
     int count = 0;
     const wchar_t *src_orig = src;
 
@@ -170,9 +175,7 @@ static int parse_index(std::vector<long> &indexes, const wchar_t *src, const wch
         return 0;
     }
 
-    while (*src != L'\0' && (iswalnum(*src) || *src == L'_')) {
-        src++;
-    }
+    while (*src != L'\0' && (iswalnum(*src) || *src == L'_')) src++;
 
     if (*src != L'[') {
         streams.err.append_format(_(BUILTIN_SET_ARG_COUNT), L"set");
@@ -180,7 +183,6 @@ static int parse_index(std::vector<long> &indexes, const wchar_t *src, const wch
     }
 
     len = src - src_orig;
-
     if ((wcsncmp(src_orig, name, len) != 0) || (wcslen(name) != (len))) {
         streams.err.append_format(
             _(L"%ls: Multiple variable names specified in single call (%ls and %.*ls)\n"), L"set",
@@ -189,37 +191,26 @@ static int parse_index(std::vector<long> &indexes, const wchar_t *src, const wch
     }
 
     src++;
-
-    while (iswspace(*src)) {
-        src++;
-    }
+    while (iswspace(*src)) src++;
 
     while (*src != L']') {
-        wchar_t *end;
-
-        long l_ind;
-
-        errno = 0;
-
-        l_ind = wcstol(src, &end, 10);
-
-        if (end == src || errno) {
+        const wchar_t *end;
+        long l_ind = fish_wcstol(src, &end);
+        if (errno > 0) {  // ignore errno == -1 meaning the int did not end with a '\0'
             streams.err.append_format(_(L"%ls: Invalid index starting at '%ls'\n"), L"set", src);
             return 0;
         }
 
-        if (l_ind < 0) {
-            l_ind = var_count + l_ind + 1;
-        }
+        if (l_ind < 0) l_ind = var_count + l_ind + 1;
 
-        src = end;
+        src = end;  //!OCLINT(parameter reassignment)
         if (*src == L'.' && *(src + 1) == L'.') {
             src += 2;
-            long l_ind2 = wcstol(src, &end, 10);
-            if (end == src || errno) {
+            long l_ind2 = fish_wcstol(src, &end);
+            if (errno > 0) {  // ignore errno == -1 meaning the int did not end with a '\0'
                 return 1;
             }
-            src = end;
+            src = end;  //!OCLINT(parameter reassignment)
 
             if (l_ind2 < 0) {
                 l_ind2 = var_count + l_ind2 + 1;
@@ -234,6 +225,7 @@ static int parse_index(std::vector<long> &indexes, const wchar_t *src, const wch
             indexes.push_back(l_ind);
             count++;
         }
+
         while (iswspace(*src)) src++;
     }
 
@@ -345,7 +337,7 @@ int builtin_set(parser_t &parser, io_streams_t &streams, wchar_t **argv) {
     int erase = 0, list = 0, unexport = 0;
     int universal = 0, query = 0;
     bool shorten_ok = true;
-    bool preserve_incoming_failure_exit_status = true;
+    bool preserve_failure_exit_status = true;
     const int incoming_exit_status = proc_get_last_status();
 
     // Variables used for performing the actual work.
@@ -353,8 +345,6 @@ int builtin_set(parser_t &parser, io_streams_t &streams, wchar_t **argv) {
     int retcode = 0;
     int scope;
     int slice = 0;
-
-    const wchar_t *bad_char = NULL;
 
     // Parse options to obtain the requested operation and the modifiers.
     w.woptind = 0;
@@ -371,12 +361,12 @@ int builtin_set(parser_t &parser, io_streams_t &streams, wchar_t **argv) {
             }
             case 'e': {
                 erase = 1;
-                preserve_incoming_failure_exit_status = false;
+                preserve_failure_exit_status = false;
                 break;
             }
             case 'n': {
                 list = 1;
-                preserve_incoming_failure_exit_status = false;
+                preserve_failure_exit_status = false;
                 break;
             }
             case 'x': {
@@ -405,7 +395,7 @@ int builtin_set(parser_t &parser, io_streams_t &streams, wchar_t **argv) {
             }
             case 'q': {
                 query = 1;
-                preserve_incoming_failure_exit_status = false;
+                preserve_failure_exit_status = false;
                 break;
             }
             case 'h': {
@@ -463,9 +453,8 @@ int builtin_set(parser_t &parser, io_streams_t &streams, wchar_t **argv) {
             wchar_t *arg = argv[i];
             int slice = 0;
 
-            if (!(dest = wcsdup(arg))) {
-                DIE_MEM();
-            }
+            dest = wcsdup(arg);
+            assert(dest);
 
             if (wcschr(dest, L'[')) {
                 slice = 1;
@@ -522,27 +511,19 @@ int builtin_set(parser_t &parser, io_streams_t &streams, wchar_t **argv) {
         return retcode;
     }
 
-    if (!(dest = wcsdup(argv[w.woptind]))) {
-        DIE_MEM();
-    }
+    dest = wcsdup(argv[w.woptind]);
+    assert(dest);
 
     if (wcschr(dest, L'[')) {
         slice = 1;
         *wcschr(dest, L'[') = 0;
     }
 
-    if (!wcslen(dest)) {
-        free(dest);
-        streams.err.append_format(BUILTIN_ERR_VARNAME_ZERO, argv[0]);
+    wcstring errstr;
+    if (!builtin_is_valid_varname(dest, errstr, argv[0])) {
+        streams.err.append(errstr);
         builtin_print_help(parser, streams, argv[0], streams.err);
-        return 1;
-    }
-
-    if ((bad_char = wcsvarname(dest))) {
-        streams.err.append_format(BUILTIN_ERR_VARCHAR, argv[0], *bad_char);
-        builtin_print_help(parser, streams, argv[0], streams.err);
-        free(dest);
-        return 1;
+        return STATUS_BUILTIN_ERROR;
     }
 
     // Set assignment can work in two modes, either using slices or using the whole array. We detect
@@ -636,7 +617,7 @@ int builtin_set(parser_t &parser, io_streams_t &streams, wchar_t **argv) {
 
     free(dest);
 
-    if (retcode == STATUS_BUILTIN_OK && preserve_incoming_failure_exit_status)
+    if (retcode == STATUS_BUILTIN_OK && preserve_failure_exit_status)
         retcode = incoming_exit_status;
     return retcode;
 }

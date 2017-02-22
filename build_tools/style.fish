@@ -30,7 +30,10 @@ if test $all = yes
         exit 1
     end
     set c_files src/*.h src/*.cpp
-    set f_files share/***.fish
+    # For now we don't restyle all fish scripts other than completion scripts. That's because people
+    # really like to vertically align the elements of the `complete` command and fish_indent
+    # currently does not honor that whitespace.
+    set f_files (printf '%s\n' share/***.fish | grep -v /completions/)
 else
     # We haven't been asked to reformat all the source. If there are uncommitted changes reformat
     # those using `git clang-format`. Else reformat the files in the most recent commit.

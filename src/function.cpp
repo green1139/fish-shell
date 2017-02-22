@@ -6,10 +6,10 @@
 
 // IWYU pragma: no_include <type_traits>
 #include <dirent.h>
-#include <errno.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <wchar.h>
+
 #include <map>
 #include <memory>
 #include <set>
@@ -37,24 +37,15 @@ static std::set<wcstring> function_tombstones;
 /// Lock for functions.
 static pthread_mutex_t functions_lock;
 
-/// Autoloader for functions.
-class function_autoload_t : public autoload_t {
-   public:
-    function_autoload_t();
-    virtual void command_removed(const wcstring &cmd);
-};
-
-static function_autoload_t function_autoloader;
-
-/// Constructor
-function_autoload_t::function_autoload_t() : autoload_t(L"fish_function_path", NULL, 0) {}
-
 static bool function_remove_ignore_autoload(const wcstring &name, bool tombstone = true);
 
 /// Callback when an autoloaded function is removed.
-void function_autoload_t::command_removed(const wcstring &cmd) {
+void autoloaded_function_removed(const wcstring &cmd) {
     function_remove_ignore_autoload(cmd, false);
 }
+
+// Function autoloader
+static autoload_t function_autoloader(L"fish_function_path", autoloaded_function_removed);
 
 /// Kludgy flag set by the load function in order to tell function_add that the function being
 /// defined is autoloaded. There should be a better way to do this...
@@ -121,10 +112,10 @@ void function_init() {
     // non-recursive lock but I haven't fully investigated all the call paths (for autoloading
     // functions, etc.).
     pthread_mutexattr_t a;
-    VOMIT_ON_FAILURE(pthread_mutexattr_init(&a));
-    VOMIT_ON_FAILURE(pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE));
-    VOMIT_ON_FAILURE(pthread_mutex_init(&functions_lock, &a));
-    VOMIT_ON_FAILURE(pthread_mutexattr_destroy(&a));
+    DIE_ON_FAILURE(pthread_mutexattr_init(&a));
+    DIE_ON_FAILURE(pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE));
+    DIE_ON_FAILURE(pthread_mutex_init(&functions_lock, &a));
+    DIE_ON_FAILURE(pthread_mutexattr_destroy(&a));
 }
 
 static std::map<wcstring, env_var_t> snapshot_vars(const wcstring_list_t &vars) {
@@ -144,7 +135,6 @@ function_info_t::function_info_t(const function_data_t &data, const wchar_t *fil
       named_arguments(data.named_arguments),
       inherit_vars(snapshot_vars(data.inherit_vars)),
       is_autoload(autoload),
-      shadow_builtin(data.shadow_builtin),
       shadow_scope(data.shadow_scope) {}
 
 function_info_t::function_info_t(const function_info_t &data, const wchar_t *filename,
@@ -156,13 +146,13 @@ function_info_t::function_info_t(const function_info_t &data, const wchar_t *fil
       named_arguments(data.named_arguments),
       inherit_vars(data.inherit_vars),
       is_autoload(autoload),
-      shadow_builtin(data.shadow_builtin),
       shadow_scope(data.shadow_scope) {}
 
 void function_add(const function_data_t &data, const parser_t &parser, int definition_line_offset) {
+    UNUSED(parser);
     ASSERT_IS_MAIN_THREAD();
 
-    CHECK(!data.name.empty(), );
+    CHECK(!data.name.empty(), );  //!OCLINT(multiple unary operator)
     CHECK(data.definition, );
     scoped_lock locker(functions_lock);
 
@@ -260,13 +250,7 @@ std::map<wcstring, env_var_t> function_get_inherit_vars(const wcstring &name) {
     return func ? func->inherit_vars : std::map<wcstring, env_var_t>();
 }
 
-int function_get_shadow_builtin(const wcstring &name) {
-    scoped_lock locker(functions_lock);
-    const function_info_t *func = function_get(name);
-    return func ? func->shadow_builtin : false;
-}
-
-int function_get_shadow_scope(const wcstring &name) {
+bool function_get_shadow_scope(const wcstring &name) {
     scoped_lock locker(functions_lock);
     const function_info_t *func = function_get(name);
     return func ? func->shadow_scope : false;
@@ -279,9 +263,9 @@ bool function_get_desc(const wcstring &name, wcstring *out_desc) {
     if (out_desc && func && !func->description.empty()) {
         out_desc->assign(_(func->description.c_str()));
         return true;
-    } else {
-        return false;
     }
+
+    return false;
 }
 
 void function_set_desc(const wcstring &name, const wcstring &desc) {
@@ -318,8 +302,8 @@ wcstring_list_t function_get_names(int get_hidden) {
         const wcstring &name = iter->first;
 
         // Maybe skip hidden.
-        if (!get_hidden) {
-            if (name.empty() || name.at(0) == L'_') continue;
+        if (!get_hidden && (name.empty() || name.at(0) == L'_')) {
+            continue;
         }
         names.insert(name);
     }
@@ -330,6 +314,12 @@ const wchar_t *function_get_definition_file(const wcstring &name) {
     scoped_lock locker(functions_lock);
     const function_info_t *func = function_get(name);
     return func ? func->definition_file : NULL;
+}
+
+bool function_is_autoloaded(const wcstring &name) {
+    scoped_lock locker(functions_lock);
+    const function_info_t *func = function_get(name);
+    return func->is_autoload;
 }
 
 int function_get_definition_offset(const wcstring &name) {

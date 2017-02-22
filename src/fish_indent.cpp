@@ -17,7 +17,6 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 */
 #include "config.h"  // IWYU pragma: keep
 
-#include <assert.h>
 #include <errno.h>
 #include <getopt.h>
 #include <locale.h>
@@ -27,6 +26,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
 #include <string.h>
 #include <wchar.h>
 #include <wctype.h>
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -84,7 +84,9 @@ static void dump_node(indent_t node_indent, const parse_node_t &node, const wcst
     wcstring source_txt = L"";
     if (node.source_start != SOURCE_OFFSET_INVALID && node.source_length != SOURCE_OFFSET_INVALID) {
         int nextc_idx = node.source_start + node.source_length;
-        if (nextc_idx < source.size()) nextc = source[node.source_start + node.source_length];
+        if ((size_t)nextc_idx < source.size()) {
+            nextc = source[node.source_start + node.source_length];
+        }
         if (node.source_start > 0) prevc = source[node.source_start - 1];
         source_txt = source.substr(node.source_start, node.source_length);
     }
@@ -100,7 +102,7 @@ static void dump_node(indent_t node_indent, const parse_node_t &node, const wcst
         nextc_str[1] = L'c';
         nextc_str[2] = nextc + '@';
     }
-    fwprintf(stderr, L"{off %4d, len %4d, indent %2u, kw %ls, %ls} [%ls|%ls|%ls]\n",
+    fwprintf(stderr, L"{off %4u, len %4u, indent %2u, kw %ls, %ls} [%ls|%ls|%ls]\n",
              node.source_start, node.source_length, node_indent, keyword_description(node.keyword),
              token_type_description(node.type), prevc_str, source_txt.c_str(), nextc_str);
 }
@@ -489,7 +491,7 @@ int main(int argc, char *argv[]) {
         case output_type_file: {
             FILE *fh = fopen(output_location, "w");
             if (fh) {
-                fputs(wcs2str(output_wtext), fh);
+                fputws(output_wtext.c_str(), fh);
                 fclose(fh);
                 exit(0);
             } else {
@@ -509,6 +511,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    fputs(colored_output.c_str(), stdout);
+    fputws(str2wcstring(colored_output).c_str(), stdout);
     return 0;
 }

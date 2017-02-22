@@ -3,6 +3,7 @@
 #define FISH_PAGER_H
 
 #include <stddef.h>
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -17,8 +18,8 @@
 /// Represents rendering from the pager.
 class page_rendering_t {
    public:
-    int term_width;
-    int term_height;
+    size_t term_width;
+    size_t term_height;
     size_t rows;
     size_t cols;
     size_t row_start;
@@ -43,12 +44,10 @@ class page_rendering_t {
 #define PAGER_UNDISCLOSED_MAX_ROWS 4
 
 typedef std::vector<completion_t> completion_list_t;
-page_rendering_t render_completions(const completion_list_t &raw_completions,
-                                    const wcstring &prefix);
 
 class pager_t {
-    int available_term_width;
-    int available_term_height;
+    size_t available_term_width;
+    size_t available_term_height;
 
     size_t selected_completion_idx;
     size_t suggested_row_start;
@@ -73,22 +72,27 @@ class pager_t {
         /// The representative completion.
         completion_t representative;
         /// On-screen width of the completion string.
-        int comp_width;
+        size_t comp_width;
         /// On-screen width of the description information.
-        int desc_width;
-        /// Preferred total width.
-        int pref_width;
+        size_t desc_width;
         /// Minimum acceptable width.
-        int min_width;
+        // size_t min_width;
 
-        comp_t()
-            : comp(),
-              desc(),
-              representative(L""),
-              comp_width(0),
-              desc_width(0),
-              pref_width(0),
-              min_width(0) {}
+        comp_t() : comp(), desc(), representative(L""), comp_width(0), desc_width(0) {}
+
+        // Our text looks like this:
+        // completion  (description)
+        // Two spaces separating, plus parens, yields 4 total extra space
+        // but only if we have a description of course
+        size_t description_punctuated_width() const {
+            return this->desc_width + (this->desc_width ? 4 : 0);
+        }
+
+        // Returns the preferred width, containing the sum of the
+        // width of the completion, separator, description
+        size_t preferred_width() const {
+            return this->comp_width + this->description_punctuated_width();
+        }
     };
 
    private:
@@ -110,11 +114,11 @@ class pager_t {
 
     bool completion_info_passes_filter(const comp_t &info) const;
 
-    void completion_print(size_t cols, int *width_per_column, size_t row_start, size_t row_stop,
-                          const wcstring &prefix, const comp_info_list_t &lst,
+    void completion_print(size_t cols, const size_t *width_per_column, size_t row_start,
+                          size_t row_stop, const wcstring &prefix, const comp_info_list_t &lst,
                           page_rendering_t *rendering) const;
     line_t completion_print_item(const wcstring &prefix, const comp_t *c, size_t row, size_t column,
-                                 int width, bool secondary, bool selected,
+                                 size_t width, bool secondary, bool selected,
                                  page_rendering_t *rendering) const;
 
    public:
@@ -128,7 +132,7 @@ class pager_t {
     void set_prefix(const wcstring &pref);
 
     // Sets the terminal width and height.
-    void set_term_size(int w, int h);
+    void set_term_size(size_t w, size_t h);
 
     // Changes the selected completion in the given direction according to the layout of the given
     // rendering. Returns true if the selection changed.

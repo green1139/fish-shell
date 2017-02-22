@@ -4,11 +4,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
 #include <map>
 #include <memory>
 #include <string>
 
 #include "common.h"
+
+extern size_t read_byte_limit;
 
 // Flags that may be passed as the 'mode' in env_set / env_get_string.
 enum {
@@ -36,8 +39,8 @@ enum {
 };
 typedef uint32_t env_mode_flags_t;
 
-/// Error code for trying to alter read-only variable.
-enum { ENV_PERM = 1, ENV_SCOPE, ENV_INVALID };
+/// Return values for `env_set()`.
+enum { ENV_OK, ENV_PERM, ENV_SCOPE, ENV_INVALID };
 
 /// A struct of configuration directories, determined in main() that fish will optionally pass to
 /// env_init.
@@ -51,26 +54,6 @@ struct config_paths_t {
 /// Initialize environment variable data.
 void env_init(const struct config_paths_t *paths = NULL);
 
-/// Set the value of the environment variable whose name matches key to val.
-///
-/// Memory policy: All keys and values are copied, the parameters can and should be freed by the
-/// caller afterwards
-///
-/// \param key The key
-/// \param val The value
-/// \param mode The type of the variable. Can be any combination of ENV_GLOBAL, ENV_LOCAL,
-/// ENV_EXPORT and ENV_USER. If mode is zero, the current variable space is searched and the current
-/// mode is used. If no current variable with the same name is found, ENV_LOCAL is assumed.
-///
-/// \returns 0 on success or an error code on failiure.
-///
-/// The current error codes are:
-///
-/// * ENV_PERM, can only be returned when setting as a user, e.g. ENV_USER is set. This means that
-/// the user tried to change a read-only variable.
-/// * ENV_SCOPE, the variable cannot be set in the given scope. This applies to readonly/electric
-/// variables set from the local or universal scopes, or set as exported.
-/// * ENV_INVALID, the variable value was invalid. This applies only to special variables.
 int env_set(const wcstring &key, const wchar_t *val, env_mode_flags_t mode);
 
 class env_var_t : public wcstring {
@@ -154,8 +137,8 @@ void env_pop();
 /// Synchronizes all universal variable changes: writes everything out, reads stuff in.
 void env_universal_barrier();
 
-/// Returns an array containing all exported variables in a format suitable for execv.
-const char *const *env_export_arr(bool recalc);
+/// Returns an array containing all exported variables in a format suitable for execv
+const char *const *env_export_arr();
 
 /// Sets up argv as the given null terminated array of strings.
 void env_set_argv(const wchar_t *const *argv);
@@ -164,19 +147,22 @@ void env_set_argv(const wchar_t *const *argv);
 wcstring_list_t env_get_names(int flags);
 
 /// Update the PWD variable directory.
-int env_set_pwd();
+bool env_set_pwd();
 
 /// Returns the PWD with a terminating slash.
 wcstring env_get_pwd_slash();
+
+/// Update the read_byte_limit variable.
+void env_set_read_limit();
 
 class env_vars_snapshot_t {
     std::map<wcstring, wcstring> vars;
     bool is_current() const;
 
-    env_vars_snapshot_t(const env_vars_snapshot_t &);
-    void operator=(const env_vars_snapshot_t &);
-
    public:
+    env_vars_snapshot_t(const env_vars_snapshot_t &) = default;
+    env_vars_snapshot_t &operator=(const env_vars_snapshot_t &) = default;
+
     env_vars_snapshot_t(const wchar_t *const *keys);
     env_vars_snapshot_t();
 
@@ -204,4 +190,9 @@ struct var_entry_t {
 };
 
 typedef std::map<wcstring, var_entry_t> var_table_t;
+
+extern bool term_has_xn;  // does the terminal have the "eat_newline_glitch"
+
+/// Returns true if we think the terminal supports setting its title.
+bool term_supports_setting_title();
 #endif

@@ -17,9 +17,11 @@
 
 #include <stdint.h>  // IWYU pragma: keep
 #include <sys/types.h>
+
 #include <limits>
 #include <string>
 
+#include "common.h"
 #include "utf8.h"
 
 #define _NXT 0x80
@@ -31,7 +33,7 @@
 
 // We can tweak the following typedef to allow us to simulate Windows-style 16 bit wchar's on Unix.
 typedef wchar_t utf8_wchar_t;
-#define UTF8_WCHAR_MAX ((size_t)std::numeric_limits<utf8_wchar_t>::max())
+#define UTF8_WCHAR_MAX (wchar_t) std::numeric_limits<utf8_wchar_t>::max()
 
 typedef std::basic_string<utf8_wchar_t> utf8_wstring_t;
 
@@ -81,7 +83,7 @@ size_t utf8_to_wchar(const char *in, size_t insize, std::wstring *out, int flags
     }
 
     size_t result;
-    if (sizeof(wchar_t) == sizeof(utf8_wchar_t)) {
+    if (sizeof(wchar_t) == sizeof(utf8_wchar_t)) {  //!OCLINT(constant if expression)
         result = utf8_to_wchar_internal(in, insize, reinterpret_cast<utf8_wstring_t *>(out), flags);
     } else if (out == NULL) {
         result = utf8_to_wchar_internal(in, insize, NULL, flags);
@@ -101,7 +103,7 @@ size_t wchar_to_utf8(const wchar_t *in, size_t insize, char *out, size_t outsize
     }
 
     size_t result;
-    if (sizeof(wchar_t) == sizeof(utf8_wchar_t)) {
+    if (sizeof(wchar_t) == sizeof(utf8_wchar_t)) {  //!OCLINT(constant if expression)
         result = wchar_to_utf8_internal(reinterpret_cast<const utf8_wchar_t *>(in), insize, out,
                                         outsize, flags);
     } else {
@@ -137,9 +139,8 @@ static int __utf8_forbitten(unsigned char octet) {
         case 0xff: {
             return -1;
         }
+        default: { return 0; }
     }
-
-    return 0;
 }
 
 /// This function translates UTF-8 string into UCS-2 or UCS-4 string (all symbols will be in local
@@ -197,7 +198,7 @@ static size_t utf8_to_wchar_internal(const char *in, size_t insize, utf8_wstring
         }
 
         // Does the sequence header tell us truth about length?
-        if (lim - p <= n - 1) {
+        if ((size_t)(lim - p) <= n - 1) {
             if ((flags & UTF8_IGNORE_ERROR) == 0) return 0;
             n = 1;
             continue;  // skip
@@ -238,7 +239,7 @@ static size_t utf8_to_wchar_internal(const char *in, size_t insize, utf8_wstring
 
         if (skip) {
             total--;
-        } else if (out_val > UTF8_WCHAR_MAX) {
+        } else if (out_val > (uint32_t)UTF8_WCHAR_MAX) {
             // wchar_t is UCS-2, but the UTF-8 specified an astral character.
             return 0;
         } else {
@@ -288,24 +289,22 @@ static size_t wchar_to_utf8_internal(const utf8_wchar_t *in, size_t insize, char
             if ((flags & UTF8_IGNORE_ERROR) == 0) return 0;
             continue;
         }
-        if (w_wide <= 0x0000007f)
+        if (w_wide <= 0x0000007f) {
             n = 1;
-        else if (w_wide <= 0x000007ff)
+        } else if (w_wide <= 0x000007ff) {
             n = 2;
-        else if (w_wide <= 0x0000ffff)
+        } else if (w_wide <= 0x0000ffff) {
             n = 3;
-        else if (w_wide <= 0x001fffff)
+        } else if (w_wide <= 0x001fffff) {
             n = 4;
-        else if (w_wide <= 0x03ffffff)
-            n = 5;
-        else
-            n = 6;  /// if (w_wide <= 0x7fffffff)
+        } else {
+            DIE("invalid wide char");
+        }
 
         total += n;
 
         if (out == NULL) continue;
-
-        if (lim - p <= n - 1) return 0;  // no space left
+        if (size_t(lim - p) <= n - 1) return 0;  // no space left
 
         // Extract the wchar_t as big-endian. If wchar_t is UCS-16, the first two bytes will be 0.
         unsigned char oc[4];
@@ -341,10 +340,14 @@ static size_t wchar_to_utf8_internal(const utf8_wchar_t *in, size_t insize, char
                 p[0] = _SEQ4 | ((oc[1] & 0x1f) >> 2);
                 break;
             }
+            default: {
+                DIE("unexpected utff8 len");
+                break;
+            }
         }
 
-        // NOTE: do not check here for forbitten UTF-8 characters. They cannot appear here because
-        // we do proper convertion.
+        // NOTE: do not check here for forbidden UTF-8 characters. They cannot appear here because
+        // we do proper conversion.
         p += n;
     }
 

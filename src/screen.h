@@ -8,12 +8,17 @@
 // of text around to handle text insertion.
 #ifndef FISH_SCREEN_H
 #define FISH_SCREEN_H
+#include "config.h"  // IWYU pragma: keep
 
-#include <assert.h>
 #include <stddef.h>
 #include <sys/stat.h>
+
+#include <algorithm>
+#include <map>
 #include <memory>
+#include <set>
 #include <vector>
+
 #include "common.h"
 #include "highlight.h"
 
@@ -54,6 +59,8 @@ struct line_t {
         text.insert(text.end(), line.text.begin(), line.text.end());
         colors.insert(colors.end(), line.colors.begin(), line.colors.end());
     }
+
+    wcstring to_string() const { return wcstring(this->text.begin(), this->text.end()); }
 };
 
 /// A class representing screen contents.
@@ -89,7 +96,9 @@ class screen_data_t {
 
     line_t &line(size_t idx) { return line_datas.at(idx); }
 
-    size_t line_count(void) { return line_datas.size(); }
+    const line_t &line(size_t idx) const { return line_datas.at(idx); }
+
+    size_t line_count() const { return line_datas.size(); }
 
     void append_lines(const screen_data_t &d) {
         this->line_datas.insert(this->line_datas.end(), d.line_datas.begin(), d.line_datas.end());
@@ -187,5 +196,81 @@ bool screen_force_clear_to_end();
 
 /// Returns the length of an escape code. Exposed for testing purposes only.
 size_t escape_code_length(const wchar_t *code);
+
+// Maintain a mapping of escape sequences to their length for fast lookup.
+class cached_esc_sequences_t {
+   private:
+    // Cached escape sequences we've already detected in the prompt and similar strings.
+    std::set<wcstring> cache;
+    // The escape sequence lengths we've cached. My original implementation used min and max
+    // length variables. The cache was then iterated over using a loop like this:
+    // `for (size_t l = min; l <= max; l++)`.
+    //
+    // However that is inefficient when there are big gaps in the lengths. This has been observed
+    // with the BobTheFish theme which has a bunch of 5 and 6 char sequences and 16 to 19 char
+    // sequences and almost nothing in between. So instead we keep track of only those escape
+    // sequence lengths we've actually cached to avoid checking for matches of lengths we know are
+    // not in our cache.
+    std::vector<size_t> lengths;
+    std::map<size_t, size_t> lengths_match_count;
+    size_t cache_hits;
+
+   public:
+    explicit cached_esc_sequences_t() : cache(), lengths(), lengths_match_count(), cache_hits(0) {}
+
+    void add_entry(const wchar_t *entry, size_t len) {
+        auto str = wcstring(entry, len);
+
+#if 0
+        // This is a can't happen scenario. I only wrote this to validate during testing that it
+        // wouldn't be triggered. I'm leaving it in but commented out in case someone feels the need
+        // to re-enable the check.
+        auto match = cache.find(str);
+        if (match != cache.end()) {
+            debug(0, "unexpected add_entry() call of a value already in the cache: '%ls'",
+                  escape(str.c_str(), ESCAPE_ALL).c_str());
+            return;
+        }
+#endif
+
+        cache.emplace(str);
+        if (std::find(lengths.begin(), lengths.end(), len) == lengths.end()) {
+            lengths.push_back(len);
+            lengths_match_count[len] = 0;
+        }
+    }
+
+    size_t find_entry(const wchar_t *entry) {
+        for (auto len : lengths) {
+            auto match = cache.find(wcstring(entry, len));
+            if (match != cache.end()) {  // we found a matching cached sequence
+                // Periodically sort  the sequence lengths so we check for matches going from the
+                // most frequently matching lengths to least frequent.
+                lengths_match_count[len]++;
+                if (++cache_hits % 1000 == 0) {
+                    // std::sort(lengths.begin(), lengths.end(), custom_cmp(lengths_match_count));
+                    std::sort(lengths.begin(), lengths.end(), [&](size_t l1, size_t l2) {
+                        return lengths_match_count[l1] > lengths_match_count[l2];
+                    });
+                }
+
+                return len;  // return the length of the matching cached sequence
+            }
+        }
+
+        return 0;  // no cached sequence matches the entry
+    }
+
+    void clear() {
+        cache.clear();
+        lengths.clear();
+        lengths_match_count.clear();
+        cache_hits = 0;
+    }
+};
+
+// Singleton that is exposed so that the cache can be invalidated when terminal related variables
+// change by calling `cached_esc_sequences.clear()`.
+extern cached_esc_sequences_t cached_esc_sequences;
 
 #endif
